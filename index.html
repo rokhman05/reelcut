@@ -260,6 +260,15 @@
       </select>
     </div>
 
+    <div>
+      <label class="small" for="speedSelect">Kecepatan proses</label>
+      <select id="speedSelect">
+        <option value="ultrafast">Tercepat (file agak lebih besar)</option>
+        <option value="veryfast" selected>Seimbang (disarankan)</option>
+        <option value="medium">Kualitas lebih tinggi (lebih lambat)</option>
+      </select>
+    </div>
+
     <div id="autoCaptionField" style="display:flex; align-items:center; gap:8px;">
       <input type="checkbox" id="autoCaptionToggle" style="width:16px; height:16px;">
       <label class="small" for="autoCaptionToggle" style="margin:0;">Buat teks otomatis dari ucapan (transkrip AI, hanya mode "Potong satu klip")</label>
@@ -307,9 +316,16 @@ import { pipeline, env } from 'https://cdn.jsdelivr.net/npm/@xenova/transformers
 env.allowLocalModels = false;
 
 const { createFFmpeg, fetchFile } = FFmpeg;
-const ffmpeg = createFFmpeg({
+// Core multi-thread: memakai banyak core CPU sekaligus (butuh cross-origin isolation,
+// yang sudah disediakan coi-serviceworker.js). Kalau browser/perangkat tidak mendukung
+// SharedArrayBuffer, otomatis jatuh ke core single-thread lama sebagai cadangan.
+const supportsThreads = typeof SharedArrayBuffer !== 'undefined' && window.crossOriginIsolated;
+const CORE_MT = 'https://unpkg.com/@ffmpeg/core-mt@0.11.0/dist/ffmpeg-core.js';
+const CORE_ST = 'https://unpkg.com/@ffmpeg/core@0.11.0/dist/ffmpeg-core.js';
+const threadCount = Math.min(navigator.hardwareConcurrency || 4, 8);
+let ffmpeg = createFFmpeg({
   log: true,
-  corePath: 'https://unpkg.com/@ffmpeg/core@0.11.0/dist/ffmpeg-core.js',
+  corePath: supportsThreads ? CORE_MT : CORE_ST,
 });
 
 const engineStatus = document.getElementById('engineStatus');
@@ -322,11 +338,28 @@ function logLine(msg){
 let ready = false;
 (async () => {
   try{
+    logLine(supportsThreads ? `Memuat mesin video (mode multi-core, ${threadCount} thread)…` : 'Memuat mesin video (mode single-core)…');
     await ffmpeg.load();
     ready = true;
     engineStatus.innerHTML = '<span class="status-dot ready"></span>Mesin video siap';
-    logLine('Mesin video (ffmpeg) siap digunakan.');
+    logLine('Mesin video (ffmpeg) siap digunakan.' + (supportsThreads ? ' Pemrosesan akan memakai banyak core CPU sekaligus, jadi lebih cepat.' : ''));
   }catch(e){
+    if(supportsThreads){
+      // core-mt gagal dimuat -> bikin instance ffmpeg baru dengan core single-thread sebagai cadangan
+      logLine('Mode multi-core gagal dimuat, mencoba mode single-core sebagai cadangan…');
+      try{
+        ffmpeg = createFFmpeg({ log: true, corePath: CORE_ST });
+        await ffmpeg.load();
+        ready = true;
+        engineStatus.innerHTML = '<span class="status-dot ready"></span>Mesin video siap (mode cadangan)';
+        logLine('Mesin video siap (single-core).');
+        return;
+      }catch(e2){
+        engineStatus.innerHTML = '<span class="status-dot" style="background:var(--danger)"></span>Gagal memuat mesin video';
+        logLine('Gagal memuat ffmpeg.wasm: ' + e2.message + '. Coba muat ulang halaman atau cek koneksi internet.');
+        return;
+      }
+    }
     engineStatus.innerHTML = '<span class="status-dot" style="background:var(--danger)"></span>Gagal memuat mesin video';
     logLine('Gagal memuat ffmpeg.wasm: ' + e.message + '. Coba muat ulang halaman atau cek koneksi internet (dibutuhkan sekali saat pertama buka).');
   }
@@ -353,6 +386,7 @@ const queueEl = document.getElementById('queue');
 const exportBtn = document.getElementById('exportBtn');
 const modeSelect = document.getElementById('modeSelect');
 const formatSelect = document.getElementById('formatSelect');
+const speedSelect = document.getElementById('speedSelect');
 const captionInput = document.getElementById('captionInput');
 const captionOptions = document.getElementById('captionOptions');
 const captionPosition = document.getElementById('captionPosition');
@@ -637,6 +671,7 @@ async function transcribeSegment(seg){
 }
 
 
+exportBtn.addEventListener('click', async () => {
   if(!ready || !sourceFile) return;
   exportBtn.disabled = true;
   exportBtn.textContent = 'Memproses…';
@@ -646,6 +681,10 @@ async function transcribeSegment(seg){
     ffmpeg.FS('writeFile', sourceName, await fetchFile(sourceFile));
 
     const format = formatSelect.value;
+    const speedPreset = speedSelect.value;
+    // Flag encoding cepat: dipakai di setiap perintah yang meng-encode ulang video (libx264).
+    // '-threads' memberi tahu x264 untuk memakai banyak core CPU sekaligus (butuh core-mt).
+    const speedFlags = ['-preset', speedPreset, '-threads', String(threadCount)];
     const caption = captionInput.value.trim();
     const mode = modeSelect.value;
     const outName = 'output.' + format;
@@ -699,7 +738,7 @@ async function transcribeSegment(seg){
       await ffmpeg.run(
         '-ss', String(seg.inPoint), '-to', String(seg.outPoint),
         '-i', sourceName, ...vf,
-        ...(format === 'mp4' ? ['-c:v','libx264','-c:a','aac'] : []),
+        ...(format === 'mp4' ? ['-c:v','libx264','-c:a','aac', ...speedFlags] : []),
         outName
       );
     } else {
@@ -711,7 +750,7 @@ async function transcribeSegment(seg){
         logLine(`Memotong klip ${i+1}/${clips.length}…`);
         await ffmpeg.run(
           '-ss', String(seg.inPoint), '-to', String(seg.outPoint),
-          '-i', sourceName, '-c:v','libx264','-c:a','aac',
+          '-i', sourceName, '-c:v','libx264','-c:a','aac', ...speedFlags,
           partName
         );
         partDurations.push(seg.outPoint - seg.inPoint);
@@ -755,7 +794,7 @@ async function transcribeSegment(seg){
 
       if(vf.length || format !== 'mp4'){
         await ffmpeg.run('-i','concat_out.mp4', ...vf,
-          ...(format === 'mp4' ? ['-c:v','libx264','-c:a','aac'] : []),
+          ...(format === 'mp4' ? ['-c:v','libx264','-c:a','aac', ...speedFlags] : []),
           outName);
       } else {
         await ffmpeg.run('-i','concat_out.mp4','-c','copy', outName);
