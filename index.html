@@ -30,7 +30,7 @@
   header{
     padding:18px 28px; border-bottom:1px solid var(--line);
     display:flex; align-items:baseline; justify-content:space-between; gap:16px;
-    flex-wrap:wrap;
+    flex-wrap:wrap; flex-shrink:0;
   }
   header h1{
     font-size:17px; font-weight:600; margin:0; letter-spacing:0.2px;
@@ -48,6 +48,7 @@
 
   .stage{
     padding:24px 28px; display:flex; flex-direction:column; gap:18px; min-width:0;
+    min-height:0; overflow-y:auto;
   }
   .dropzone{
     flex:1; border:1px dashed var(--line); border-radius:10px;
@@ -115,7 +116,7 @@
 
   aside{
     border-left:1px solid var(--line); padding:24px 22px; display:flex; flex-direction:column; gap:20px;
-    background:var(--panel);
+    background:var(--panel); min-height:0; overflow-y:auto;
   }
   aside h2{
     font-size:12px; text-transform:none; color:var(--muted); margin:0 0 4px 0; font-weight:600;
@@ -126,6 +127,32 @@
   .queue-item{
     background:var(--panel-2); border:1px solid var(--line); border-radius:8px;
     padding:9px 11px; display:flex; justify-content:space-between; align-items:center; font-size:12.5px;
+  }
+  .queue-item.expanded{
+    flex-direction:column; align-items:stretch; gap:8px; padding:11px;
+  }
+  .queue-item.expanded .queue-head{
+    display:flex; justify-content:space-between; align-items:center; font-weight:600;
+  }
+  .queue-item .mini-field{
+    width:100%; background:var(--bg); border:1px solid var(--line); color:var(--text);
+    padding:7px 9px; border-radius:6px; font-size:12px;
+  }
+  .queue-item .mini-check{
+    display:flex; align-items:center; gap:6px; font-size:11px; color:var(--muted);
+  }
+  .queue-item .mini-actions{
+    display:flex; gap:6px;
+  }
+  .queue-item .mini-actions button{
+    flex:1; background:transparent; border:1px solid var(--line); color:var(--text);
+    padding:6px 8px; border-radius:6px; cursor:pointer; font-size:11.5px;
+  }
+  .queue-item .mini-actions button:hover{ border-color:var(--accent); }
+  .queue-item .mini-actions button:disabled{ opacity:0.5; cursor:not-allowed; }
+  .queue-item .mini-status{ font-size:11px; color:var(--muted); }
+  .queue-item video.mini-preview{
+    width:100%; border-radius:8px; background:#000; display:block;
   }
   .queue-item button{
     background:none; border:none; color:var(--muted); cursor:pointer; font-size:13px;
@@ -158,6 +185,7 @@
 
   footer{
     border-top:1px solid var(--line); padding:12px 28px; color:var(--muted); font-size:11.5px;
+    position:relative; z-index:5; background:var(--bg); flex-shrink:0;
   }
   a{ color: var(--accent); }
 </style>
@@ -217,7 +245,8 @@
   <aside>
     <div>
       <h2>Daftar potongan</h2>
-      <div class="queue" id="queue">
+      <div style="color:var(--muted); font-size:11.5px; margin:-2px 0 8px 0;">Tiap potongan bisa dipratinjau & diunduh sendiri-sendiri sebelum kamu putuskan mana yang dipakai.</div>
+      <div class="queue" id="queue" style="max-height:360px;">
         <div class="queue-empty">Belum ada potongan. Tandai awal &amp; akhir, lalu tambahkan.</div>
       </div>
     </div>
@@ -424,9 +453,10 @@ async function ensureFont(){
 
 let duration = 0;
 let inPoint = 0, outPoint = 0;
-let clips = []; // {inPoint, outPoint}
+let clips = []; // {inPoint, outPoint, caption, autoCaption}
 let sourceFile = null;
 let sourceName = 'input.mp4';
+let busy = false; // mencegah dua proses ffmpeg berjalan bersamaan (export utama, pratinjau, atau unduh per-klip)
 
 function fmt(t){
   if(!isFinite(t)) t = 0;
@@ -536,19 +566,181 @@ function renderQueue(){
   queueEl.innerHTML = '';
   clips.forEach((c, i) => {
     const row = document.createElement('div');
-    row.className = 'queue-item';
-    row.innerHTML = `<span>Klip ${i+1}: ${fmt(c.inPoint)} – ${fmt(c.outPoint)}</span>`;
+    row.className = 'queue-item expanded';
+
+    const head = document.createElement('div');
+    head.className = 'queue-head';
+    head.innerHTML = `<span>Klip ${i+1}: ${fmt(c.inPoint)} – ${fmt(c.outPoint)}</span>`;
     const del = document.createElement('button');
     del.textContent = '✕';
+    del.title = 'Hapus potongan ini';
+    del.style.cssText = 'background:none; border:none; color:var(--muted); cursor:pointer; font-size:13px;';
     del.addEventListener('click', () => { clips.splice(i,1); renderQueue(); });
-    row.appendChild(del);
+    head.appendChild(del);
+    row.appendChild(head);
+
+    const capInput = document.createElement('input');
+    capInput.className = 'mini-field';
+    capInput.placeholder = 'Caption untuk klip ini (opsional)';
+    capInput.value = c.caption || '';
+    capInput.addEventListener('input', () => { c.caption = capInput.value; });
+    row.appendChild(capInput);
+
+    const autoLabel = document.createElement('label');
+    autoLabel.className = 'mini-check';
+    const autoChk = document.createElement('input');
+    autoChk.type = 'checkbox';
+    autoChk.checked = !!c.autoCaption;
+    autoChk.addEventListener('change', () => {
+      c.autoCaption = autoChk.checked;
+      capInput.disabled = autoChk.checked;
+      capInput.placeholder = autoChk.checked ? 'Teks otomatis akan dibuat dari ucapan saat pratinjau/unduh' : 'Caption untuk klip ini (opsional)';
+    });
+    capInput.disabled = !!c.autoCaption;
+    autoLabel.appendChild(autoChk);
+    autoLabel.appendChild(document.createTextNode('Buat teks otomatis dari ucapan untuk klip ini'));
+    row.appendChild(autoLabel);
+
+    const actions = document.createElement('div');
+    actions.className = 'mini-actions';
+    const previewBtn = document.createElement('button');
+    previewBtn.textContent = 'Pratinjau';
+    const downloadBtn = document.createElement('button');
+    downloadBtn.textContent = 'Unduh klip ini';
+    actions.appendChild(previewBtn);
+    actions.appendChild(downloadBtn);
+    row.appendChild(actions);
+
+    const statusEl = document.createElement('div');
+    statusEl.className = 'mini-status';
+    statusEl.style.display = 'none';
+    row.appendChild(statusEl);
+
+    const previewVideo = document.createElement('video');
+    previewVideo.className = 'mini-preview';
+    previewVideo.controls = true;
+    previewVideo.style.display = 'none';
+    row.appendChild(previewVideo);
+
+    previewBtn.addEventListener('click', () => runClipAction(c, i, {
+      isPreview: true, statusEl, previewVideo, btn: previewBtn, otherBtn: downloadBtn
+    }));
+    downloadBtn.addEventListener('click', () => runClipAction(c, i, {
+      isPreview: false, statusEl, previewVideo, btn: downloadBtn, otherBtn: previewBtn
+    }));
+
     queueEl.appendChild(row);
   });
   exportBtn.disabled = !ready;
 }
 
+// ---- Render satu klip saja (dipakai oleh tombol Pratinjau & Unduh klip ini di daftar)
+// isPreview=true -> resolusi diperkecil & preset tercepat, hanya untuk melihat hasil cepat.
+// isPreview=false -> kualitas penuh sesuai pengaturan format/kecepatan di panel, langsung diunduh.
+async function runClipAction(clip, index, { isPreview, statusEl, previewVideo, btn, otherBtn }){
+  if(!ready || !sourceFile) return;
+  if(busy){ logLine('Mesin video sedang memproses sesuatu, tunggu selesai dulu ya.'); return; }
+  busy = true;
+  exportBtn.disabled = true;
+  btn.disabled = true; otherBtn.disabled = true;
+  const originalLabel = btn.textContent;
+  btn.textContent = isPreview ? 'Membuat pratinjau…' : 'Memproses…';
+  statusEl.style.display = 'block';
+  statusEl.textContent = isPreview
+    ? 'Membuat pratinjau cepat (resolusi diperkecil supaya cepat)…'
+    : 'Memproses klip ini dalam kualitas penuh…';
+  engineStatus.innerHTML = '<span class="status-dot busy"></span>Sedang memproses video…';
+
+  let outName = '';
+  try{
+    ffmpeg.FS('writeFile', sourceName, await fetchFile(sourceFile));
+
+    const aspect = aspectSelect.value;
+    const format = isPreview ? 'mp4' : formatSelect.value;
+    const preset = isPreview ? 'ultrafast' : speedSelect.value;
+    const vfFilters = [];
+
+    if(aspect === '9:16'){
+      vfFilters.push('crop=ih*9/16:ih', isPreview ? 'scale=540:960' : 'scale=1080:1920');
+    } else if(aspect === '1:1'){
+      vfFilters.push('crop=ih:ih', isPreview ? 'scale=540:540' : 'scale=1080:1080');
+    } else if(isPreview){
+      vfFilters.push('scale=640:-2');
+    }
+    if(format === 'gif'){
+      vfFilters.push('fps=12,scale=480:-1:flags=lanczos');
+    }
+
+    const size = captionSize.value;
+    const color = captionColor.value;
+    let yExpr = 'h-text_h-40';
+    if(captionPosition.value === 'top') yExpr = '40';
+    if(captionPosition.value === 'center') yExpr = '(h-text_h)/2';
+    const fontfileArg = fontReady ? "fontfile='/font.ttf':" : '';
+
+    let autoChunks = null;
+    if(clip.autoCaption){
+      await ensureFont();
+      statusEl.textContent = 'Mentranskrip ucapan klip ini…';
+      autoChunks = await transcribeSegment(clip);
+    } else if(clip.caption && clip.caption.trim()){
+      await ensureFont();
+    }
+
+    if(autoChunks && autoChunks.length){
+      autoChunks.forEach(ch => {
+        const safeText = ch.text.replace(/\\/g,'\\\\').replace(/'/g, "\\'").replace(/:/g, '\\:').replace(/,/g, '\\,');
+        vfFilters.push(`drawtext=${fontfileArg}text='${safeText}':fontcolor=${color}:fontsize=${size}:borderw=2:bordercolor=black:x=(w-text_w)/2:y=${yExpr}:enable='between(t\\,${ch.start.toFixed(2)}\\,${ch.end.toFixed(2)})'`);
+      });
+    } else if(clip.caption && clip.caption.trim()){
+      const safeText = clip.caption.trim().replace(/\\/g,'\\\\').replace(/'/g, "\\'").replace(/:/g, '\\:');
+      vfFilters.push(`drawtext=${fontfileArg}text='${safeText}':fontcolor=${color}:fontsize=${size}:borderw=2:bordercolor=black:x=(w-text_w)/2:y=${yExpr}`);
+    }
+
+    const vf = vfFilters.length ? ['-vf', vfFilters.join(',')] : [];
+    outName = (isPreview ? 'preview_' : 'clip_') + index + '.' + format;
+    statusEl.textContent = isPreview ? 'Merender pratinjau…' : `Merender klip ${index+1}…`;
+
+    await ffmpeg.run(
+      '-ss', String(clip.inPoint), '-to', String(clip.outPoint),
+      '-i', sourceName, ...vf,
+      ...(format === 'mp4' ? ['-c:v','libx264','-c:a','aac','-preset', preset, '-threads', String(threadCount)] : []),
+      outName
+    );
+
+    const data = ffmpeg.FS('readFile', outName);
+    const mime = format === 'gif' ? 'image/gif' : (format === 'webm' ? 'video/webm' : 'video/mp4');
+    const blob = new Blob([data.buffer], { type: mime });
+    const url = URL.createObjectURL(blob);
+
+    if(isPreview){
+      previewVideo.src = url;
+      previewVideo.style.display = 'block';
+      statusEl.textContent = 'Pratinjau siap (resolusi diperkecil). Kualitas hasil unduhan asli akan lebih baik dari ini.';
+      logLine(`Pratinjau klip ${index+1} siap dilihat.`);
+    } else {
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `reelcut-klip${index+1}.` + format;
+      a.click();
+      statusEl.textContent = 'Klip ini sudah diunduh ke perangkatmu.';
+      logLine(`Klip ${index+1} diunduh: reelcut-klip${index+1}.${format}`);
+    }
+  }catch(err){
+    statusEl.textContent = 'Gagal memproses klip ini: ' + err.message;
+    logLine(`Error pada klip ${index+1}: ` + err.message);
+  }finally{
+    try{ if(outName) ffmpeg.FS('unlink', outName); }catch(e){}
+    btn.disabled = false; otherBtn.disabled = false;
+    btn.textContent = originalLabel;
+    exportBtn.disabled = !ready;
+    engineStatus.innerHTML = '<span class="status-dot ready"></span>Mesin video siap';
+    busy = false;
+  }
+}
+
 addClipBtn.addEventListener('click', () => {
-  clips.push({ inPoint, outPoint });
+  clips.push({ inPoint, outPoint, caption: captionInput.value.trim(), autoCaption: false });
   renderQueue();
   logLine(`Potongan ditambahkan: ${fmt(inPoint)} – ${fmt(outPoint)}`);
 });
@@ -564,16 +756,29 @@ async function ensureWhisper(){
   return whisperPipeline;
 }
 
-async function decodeWavToFloat32(bytes){
-  const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-  const buffer = await audioCtx.decodeAudioData(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength));
-  const data = buffer.getChannelData(0);
-  await audioCtx.close();
-  return data;
+async function decodeWavTo16k(bytes){
+  const arrayBuf = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+  const tmpCtx = new (window.AudioContext || window.webkitAudioContext)();
+  const decoded = await tmpCtx.decodeAudioData(arrayBuf.slice(0));
+  await tmpCtx.close();
+  // Beberapa perangkat mendekode audio di sample rate asli device (mis. 48000Hz),
+  // bukan di 16000Hz seperti yang kita minta dari ffmpeg. Kalau dibiarkan, index waktu
+  // untuk "cari momen" jadi meleset dan hasil transkrip Whisper (yang butuh input 16kHz)
+  // jadi tidak akurat. Di-resample ulang ke 16000Hz di sini supaya keduanya benar.
+  const targetRate = 16000;
+  const offline = new OfflineAudioContext(1, Math.ceil(decoded.duration * targetRate), targetRate);
+  const src = offline.createBufferSource();
+  src.buffer = decoded;
+  src.connect(offline.destination);
+  src.start();
+  const rendered = await offline.startRendering();
+  return rendered.getChannelData(0);
 }
 
 findHighlightsBtn.addEventListener('click', async () => {
   if(!ready || !sourceFile) return;
+  if(busy){ logLine('Mesin video sedang memproses sesuatu, tunggu selesai dulu ya.'); return; }
+  busy = true;
   findHighlightsBtn.disabled = true;
   findHighlightsBtn.textContent = 'Menganalisis…';
   highlightResults.innerHTML = '';
@@ -584,7 +789,7 @@ findHighlightsBtn.addEventListener('click', async () => {
     }
     await ffmpeg.run('-i', sourceName, '-ar','16000','-ac','1','-f','wav','highlight_audio.wav');
     const wavData = ffmpeg.FS('readFile','highlight_audio.wav');
-    const samples = await decodeWavToFloat32(wavData);
+    const samples = await decodeWavTo16k(wavData);
     const sr = 16000;
     const windowSize = sr; // 1 detik
     const energies = [];
@@ -631,7 +836,7 @@ findHighlightsBtn.addEventListener('click', async () => {
         btn.textContent = '+ Tambah';
         btn.style.color = 'var(--accent)';
         btn.addEventListener('click', () => {
-          clips.push({ inPoint: c.inPoint, outPoint: c.outPoint });
+          clips.push({ inPoint: c.inPoint, outPoint: c.outPoint, caption: captionInput.value.trim(), autoCaption: false });
           renderQueue();
           logLine(`Momen ditambahkan ke daftar: ${fmt(c.inPoint)} – ${fmt(c.outPoint)}`);
         });
@@ -645,6 +850,7 @@ findHighlightsBtn.addEventListener('click', async () => {
   }finally{
     findHighlightsBtn.disabled = false;
     findHighlightsBtn.textContent = 'Cari momen';
+    busy = false;
   }
 });
 
@@ -659,7 +865,7 @@ async function transcribeSegment(seg){
     '-i', sourceName, '-ar','16000','-ac','1','-f','wav','caption_audio.wav'
   );
   const wavData = ffmpeg.FS('readFile','caption_audio.wav');
-  const samples = await decodeWavToFloat32(wavData);
+  const samples = await decodeWavTo16k(wavData);
   transcriptStatus.textContent = 'Mentranskrip ucapan…';
   const result = await whisperPipeline(samples, { return_timestamps: true, chunk_length_s: 30, stride_length_s: 5 });
   transcriptStatus.textContent = `Transkrip selesai (${(result.chunks||[]).length} baris teks).`;
@@ -673,6 +879,8 @@ async function transcribeSegment(seg){
 
 exportBtn.addEventListener('click', async () => {
   if(!ready || !sourceFile) return;
+  if(busy){ logLine('Mesin video sedang memproses sesuatu, tunggu selesai dulu ya.'); return; }
+  busy = true;
   exportBtn.disabled = true;
   exportBtn.textContent = 'Memproses…';
   engineStatus.innerHTML = '<span class="status-dot busy"></span>Sedang memproses video…';
@@ -817,6 +1025,7 @@ exportBtn.addEventListener('click', async () => {
     exportBtn.disabled = false;
     exportBtn.textContent = 'Proses & Unduh';
     engineStatus.innerHTML = '<span class="status-dot ready"></span>Mesin video siap';
+    busy = false;
   }
 });
 </script>
