@@ -200,6 +200,17 @@
         <button class="ghost" id="setOut">Tandai akhir di sini</button>
         <button class="primary" id="addClip">+ Tambah potongan ke daftar</button>
       </div>
+
+      <div style="border-top:1px solid var(--line); padding-top:14px; display:flex; flex-direction:column; gap:8px;">
+        <div style="display:flex; align-items:center; justify-content:space-between; gap:10px;">
+          <div>
+            <strong style="font-size:13px;">Cari momen menarik otomatis</strong>
+            <div style="color:var(--muted); font-size:11.5px; margin-top:2px;">Berdasar lonjakan energi audio (tawa, penekanan suara) — bukan analisis AI semantik, jadi anggap ini titik awal, bukan hasil final.</div>
+          </div>
+          <button class="ghost" id="findHighlights" style="white-space:nowrap;">Cari momen</button>
+        </div>
+        <div class="queue" id="highlightResults"></div>
+      </div>
     </div>
   </section>
 
@@ -232,6 +243,15 @@
     </div>
 
     <div>
+      <label class="small" for="aspectSelect">Rasio keluaran</label>
+      <select id="aspectSelect">
+        <option value="original">Asli (tidak dipotong)</option>
+        <option value="9:16">9:16 vertikal (Reels/TikTok/Shorts)</option>
+        <option value="1:1">1:1 kotak (Instagram feed)</option>
+      </select>
+    </div>
+
+    <div>
       <label class="small" for="formatSelect">Format keluaran</label>
       <select id="formatSelect">
         <option value="mp4">MP4 (paling kompatibel)</option>
@@ -240,8 +260,13 @@
       </select>
     </div>
 
+    <div id="autoCaptionField" style="display:flex; align-items:center; gap:8px;">
+      <input type="checkbox" id="autoCaptionToggle" style="width:16px; height:16px;">
+      <label class="small" for="autoCaptionToggle" style="margin:0;">Buat teks otomatis dari ucapan (transkrip AI, hanya mode "Potong satu klip")</label>
+    </div>
+
     <div>
-      <label class="small" for="captionInput">Teks overlay (opsional)</label>
+      <label class="small" for="captionInput">Teks overlay manual (opsional, dipakai jika teks otomatis nonaktif)</label>
       <input class="field" id="captionInput" placeholder="Contoh: Sale Hari Ini!">
     </div>
 
@@ -264,6 +289,8 @@
       <input type="range" id="captionSize" min="16" max="72" step="2" value="32" style="width:100%;">
     </div>
 
+    <div id="transcriptStatus" style="display:none; font-size:11.5px; color:var(--muted);"></div>
+
     <button class="export-btn" id="exportBtn" disabled>Proses & Unduh</button>
 
     <div class="log" id="log">Menunggu file video…</div>
@@ -271,11 +298,14 @@
 </main>
 
 <footer>
-  Reelcut berjalan sepenuhnya di perangkatmu lewat WebAssembly (ffmpeg.wasm). Simpan file ini dan buka kapan pun — tidak ada kuota, langganan, atau token yang habis.
+  Reelcut berjalan sepenuhnya di perangkatmu lewat WebAssembly (ffmpeg.wasm untuk video, model AI open-source untuk transkripsi ucapan). Simpan file ini dan buka kapan pun — tidak ada kuota, langganan, atau token yang habis. Deteksi momen menarik berbasis heuristik energi audio, bukan model AI semantik seperti pada aplikasi berbayar.
 </footer>
 
 <script src="https://unpkg.com/@ffmpeg/ffmpeg@0.11.6/dist/ffmpeg.min.js"></script>
-<script>
+<script type="module">
+import { pipeline, env } from 'https://cdn.jsdelivr.net/npm/@xenova/transformers@2.17.2';
+env.allowLocalModels = false;
+
 const { createFFmpeg, fetchFile } = FFmpeg;
 const ffmpeg = createFFmpeg({
   log: true,
@@ -333,6 +363,11 @@ const transitionField = document.getElementById('transitionField');
 const transitionSelect = document.getElementById('transitionSelect');
 const transitionDur = document.getElementById('transitionDur');
 const transitionDurVal = document.getElementById('transitionDurVal');
+const aspectSelect = document.getElementById('aspectSelect');
+const autoCaptionToggle = document.getElementById('autoCaptionToggle');
+const findHighlightsBtn = document.getElementById('findHighlights');
+const highlightResults = document.getElementById('highlightResults');
+const transcriptStatus = document.getElementById('transcriptStatus');
 
 captionSize.addEventListener('input', () => { captionSizeVal.textContent = captionSize.value; });
 transitionDur.addEventListener('input', () => { transitionDurVal.textContent = transitionDur.value; });
@@ -484,7 +519,124 @@ addClipBtn.addEventListener('click', () => {
   logLine(`Potongan ditambahkan: ${fmt(inPoint)} – ${fmt(outPoint)}`);
 });
 
-exportBtn.addEventListener('click', async () => {
+// ---- Cari momen menarik (heuristik energi audio)
+let whisperPipeline = null;
+async function ensureWhisper(){
+  if(whisperPipeline) return whisperPipeline;
+  transcriptStatus.style.display = 'block';
+  transcriptStatus.textContent = 'Mengunduh model transkripsi AI (sekali saja, ±75MB)…';
+  whisperPipeline = await pipeline('automatic-speech-recognition', 'Xenova/whisper-tiny');
+  transcriptStatus.textContent = 'Model transkripsi siap.';
+  return whisperPipeline;
+}
+
+async function decodeWavToFloat32(bytes){
+  const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  const buffer = await audioCtx.decodeAudioData(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength));
+  const data = buffer.getChannelData(0);
+  await audioCtx.close();
+  return data;
+}
+
+findHighlightsBtn.addEventListener('click', async () => {
+  if(!ready || !sourceFile) return;
+  findHighlightsBtn.disabled = true;
+  findHighlightsBtn.textContent = 'Menganalisis…';
+  highlightResults.innerHTML = '';
+  try{
+    logLine('Mengekstrak audio untuk analisis momen menarik…');
+    if(!ffmpeg.FS('readdir','/').includes(sourceName)){
+      ffmpeg.FS('writeFile', sourceName, await fetchFile(sourceFile));
+    }
+    await ffmpeg.run('-i', sourceName, '-ar','16000','-ac','1','-f','wav','highlight_audio.wav');
+    const wavData = ffmpeg.FS('readFile','highlight_audio.wav');
+    const samples = await decodeWavToFloat32(wavData);
+    const sr = 16000;
+    const windowSize = sr; // 1 detik
+    const energies = [];
+    for(let i=0; i<samples.length; i += windowSize){
+      let sum = 0;
+      const end = Math.min(i+windowSize, samples.length);
+      for(let j=i;j<end;j++) sum += samples[j]*samples[j];
+      energies.push(Math.sqrt(sum/(end-i)));
+    }
+    const mean = energies.reduce((a,b)=>a+b,0)/energies.length;
+    const variance = energies.reduce((a,b)=>a+(b-mean)*(b-mean),0)/energies.length;
+    const std = Math.sqrt(variance);
+    const threshold = mean + std * 1.1;
+
+    const clipLen = 24; // detik per klip usulan
+    const candidates = [];
+    for(let i=0;i<energies.length;i++){
+      if(energies[i] > threshold){
+        candidates.push({ t: i, score: energies[i] });
+      }
+    }
+    candidates.sort((a,b)=>b.score-a.score);
+
+    const chosen = [];
+    for(const c of candidates){
+      const start = Math.max(0, c.t - clipLen*0.35);
+      const end = Math.min(duration, start + clipLen);
+      const overlaps = chosen.some(ch => !(end <= ch.inPoint || start >= ch.outPoint));
+      if(!overlaps){
+        chosen.push({ inPoint: start, outPoint: end, score: c.score });
+      }
+      if(chosen.length >= 5) break;
+    }
+    chosen.sort((a,b)=>a.inPoint-b.inPoint);
+
+    if(chosen.length === 0){
+      highlightResults.innerHTML = '<div class="queue-empty">Tidak ada lonjakan energi yang menonjol. Coba tandai klip secara manual.</div>';
+    } else {
+      chosen.forEach((c) => {
+        const row = document.createElement('div');
+        row.className = 'queue-item';
+        row.innerHTML = `<span>${fmt(c.inPoint)} – ${fmt(c.outPoint)}</span>`;
+        const btn = document.createElement('button');
+        btn.textContent = '+ Tambah';
+        btn.style.color = 'var(--accent)';
+        btn.addEventListener('click', () => {
+          clips.push({ inPoint: c.inPoint, outPoint: c.outPoint });
+          renderQueue();
+          logLine(`Momen ditambahkan ke daftar: ${fmt(c.inPoint)} – ${fmt(c.outPoint)}`);
+        });
+        row.appendChild(btn);
+        highlightResults.appendChild(row);
+      });
+    }
+    logLine(`Analisis selesai, ${chosen.length} momen diusulkan.`);
+  }catch(err){
+    logLine('Gagal menganalisis momen: ' + err.message);
+  }finally{
+    findHighlightsBtn.disabled = false;
+    findHighlightsBtn.textContent = 'Cari momen';
+  }
+});
+
+// ---- Auto-caption (transkrip AI) untuk klip terpilih
+async function transcribeSegment(seg){
+  transcriptStatus.style.display = 'block';
+  transcriptStatus.textContent = 'Mengekstrak audio klip…';
+  await ensureWhisper();
+  ffmpeg.FS('writeFile', sourceName, await fetchFile(sourceFile));
+  await ffmpeg.run(
+    '-ss', String(seg.inPoint), '-to', String(seg.outPoint),
+    '-i', sourceName, '-ar','16000','-ac','1','-f','wav','caption_audio.wav'
+  );
+  const wavData = ffmpeg.FS('readFile','caption_audio.wav');
+  const samples = await decodeWavToFloat32(wavData);
+  transcriptStatus.textContent = 'Mentranskrip ucapan…';
+  const result = await whisperPipeline(samples, { return_timestamps: true, chunk_length_s: 30, stride_length_s: 5 });
+  transcriptStatus.textContent = `Transkrip selesai (${(result.chunks||[]).length} baris teks).`;
+  return (result.chunks || []).map(c => ({
+    start: Math.max(0, c.timestamp[0] ?? 0),
+    end: c.timestamp[1] ?? (seg.outPoint - seg.inPoint),
+    text: c.text.trim()
+  })).filter(c => c.text.length > 0);
+}
+
+
   if(!ready || !sourceFile) return;
   exportBtn.disabled = true;
   exportBtn.textContent = 'Memproses…';
@@ -497,21 +649,46 @@ exportBtn.addEventListener('click', async () => {
     const caption = captionInput.value.trim();
     const mode = modeSelect.value;
     const outName = 'output.' + format;
+    const aspect = aspectSelect.value;
+    const useAutoCaption = autoCaptionToggle.checked && mode === 'single';
 
-    if(caption) await ensureFont();
+    let autoChunks = null;
+    if(useAutoCaption){
+      const seg = clips.length ? clips[0] : { inPoint, outPoint };
+      logLine('Membuat teks otomatis dari ucapan…');
+      await ensureFont();
+      autoChunks = await transcribeSegment(seg);
+      logLine(`Teks otomatis siap: ${autoChunks.length} baris.`);
+    } else if(caption){
+      await ensureFont();
+    }
 
     const vfFilters = [];
+
+    if(aspect === '9:16'){
+      vfFilters.push('crop=ih*9/16:ih', 'scale=1080:1920');
+    } else if(aspect === '1:1'){
+      vfFilters.push('crop=ih:ih', 'scale=1080:1080');
+    }
+
     if(format === 'gif'){
       vfFilters.push('fps=12,scale=480:-1:flags=lanczos');
     }
-    if(caption){
+
+    const size = captionSize.value;
+    const color = captionColor.value;
+    let yExpr = 'h-text_h-40';
+    if(captionPosition.value === 'top') yExpr = '40';
+    if(captionPosition.value === 'center') yExpr = '(h-text_h)/2';
+    const fontfileArg = fontReady ? "fontfile='/font.ttf':" : '';
+
+    if(useAutoCaption && autoChunks && autoChunks.length){
+      autoChunks.forEach(c => {
+        const safeText = c.text.replace(/\\/g,'\\\\').replace(/'/g, "\\'").replace(/:/g, '\\:').replace(/,/g, '\\,');
+        vfFilters.push(`drawtext=${fontfileArg}text='${safeText}':fontcolor=${color}:fontsize=${size}:borderw=2:bordercolor=black:x=(w-text_w)/2:y=${yExpr}:enable='between(t\\,${c.start.toFixed(2)}\\,${c.end.toFixed(2)})'`);
+      });
+    } else if(caption){
       const safeText = caption.replace(/\\/g,'\\\\').replace(/'/g, "\\'").replace(/:/g, '\\:');
-      const size = captionSize.value;
-      const color = captionColor.value;
-      let yExpr = 'h-text_h-40';
-      if(captionPosition.value === 'top') yExpr = '40';
-      if(captionPosition.value === 'center') yExpr = '(h-text_h)/2';
-      const fontfileArg = fontReady ? "fontfile='/font.ttf':" : '';
       vfFilters.push(`drawtext=${fontfileArg}text='${safeText}':fontcolor=${color}:fontsize=${size}:borderw=2:bordercolor=black:x=(w-text_w)/2:y=${yExpr}`);
     }
     const vf = vfFilters.length ? ['-vf', vfFilters.join(',')] : [];
