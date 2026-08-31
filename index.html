@@ -485,7 +485,7 @@ async function detectFaceCenterX(seg){
     return null;
   }
   const fracs = [0.25, 0.5, 0.75];
-  const centers = [];
+  const allFaces = []; // {cx, area} dari SEMUA wajah di SEMUA frame sampel, bukan cuma satu
   for(let i=0;i<fracs.length;i++){
     const t = seg.inPoint + (seg.outPoint - seg.inPoint) * fracs[i];
     const frameName = `face_frame_${i}.jpg`;
@@ -498,14 +498,30 @@ async function detectFaceCenterX(seg){
       const canvas = document.createElement('canvas');
       canvas.width = bitmap.width; canvas.height = bitmap.height;
       canvas.getContext('2d').drawImage(bitmap, 0, 0);
-      const det = await faceapi.detectSingleFace(canvas, new faceapi.TinyFaceDetectorOptions());
-      if(det){
-        centers.push((det.box.x + det.box.width/2) / bitmap.width);
-      }
+      // detectAllFaces, bukan detectSingleFace -> kalau ada beberapa orang bicara bersamaan,
+      // semuanya ikut dihitung, bukan cuma satu yang kebetulan paling pede terdeteksi.
+      const dets = await faceapi.detectAllFaces(canvas, new faceapi.TinyFaceDetectorOptions());
+      dets.forEach(det => {
+        allFaces.push({
+          cx: (det.box.x + det.box.width/2) / bitmap.width,
+          area: det.box.width * det.box.height
+        });
+      });
     }catch(err){ /* lewati frame ini kalau gagal diekstrak/dideteksi */ }
   }
-  if(centers.length === 0) return null; // tidak ada wajah terdeteksi -> fallback ke crop tengah
-  return centers.reduce((a,b)=>a+b,0)/centers.length;
+  if(allFaces.length === 0) return null; // tidak ada wajah terdeteksi -> fallback ke crop tengah
+
+  // Titik tengah crop = rata-rata posisi SEMUA wajah, dibobot ukurannya (wajah yang lebih besar/
+  // dekat kamera biasanya subjek utama, jadi pengaruhnya lebih besar ke posisi crop).
+  const totalArea = allFaces.reduce((a,f)=>a+f.area,0);
+  const weightedCenter = allFaces.reduce((a,f)=>a + f.cx*f.area, 0) / totalArea;
+
+  const xs = allFaces.map(f=>f.cx);
+  const spread = Math.max(...xs) - Math.min(...xs);
+  if(allFaces.length > fracs.length && spread > 0.5){
+    logLine('Beberapa wajah terdeteksi cukup berjauhan — crop vertikal mungkin tidak bisa memuat semuanya sekaligus, dipusatkan di rata-rata posisi.');
+  }
+  return weightedCenter;
 }
 
 // Menyusun filter crop, dengan titik tengah horizontal mengikuti posisi wajah kalau ada (centerXFrac 0..1),
