@@ -1,0 +1,608 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Reelcut — Pemotong Video Browser</title>
+<style>
+  :root{
+    --bg: #12151a;
+    --panel: #1a1e26;
+    --panel-2: #20242e;
+    --line: #2a2f3a;
+    --text: #e9e7e2;
+    --muted: #8b909c;
+    --accent: #e3a13d;
+    --accent-dim: #6b5227;
+    --danger: #d9736a;
+    --good: #7fb686;
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  }
+  *{box-sizing:border-box;}
+  html,body{
+    margin:0; padding:0; background:var(--bg); color:var(--text);
+    height:100%;
+  }
+  body{
+    display:flex; flex-direction:column; min-height:100vh;
+  }
+  header{
+    padding:18px 28px; border-bottom:1px solid var(--line);
+    display:flex; align-items:baseline; justify-content:space-between; gap:16px;
+    flex-wrap:wrap;
+  }
+  header h1{
+    font-size:17px; font-weight:600; margin:0; letter-spacing:0.2px;
+  }
+  header h1 span{ color: var(--accent); }
+  header p{ margin:0; color:var(--muted); font-size:13px; }
+
+  main{
+    flex:1; display:grid; grid-template-columns: 1fr 300px;
+    gap:0; min-height:0;
+  }
+  @media (max-width: 860px){
+    main{ grid-template-columns: 1fr; }
+  }
+
+  .stage{
+    padding:24px 28px; display:flex; flex-direction:column; gap:18px; min-width:0;
+  }
+  .dropzone{
+    flex:1; border:1px dashed var(--line); border-radius:10px;
+    display:flex; align-items:center; justify-content:center; flex-direction:column; gap:10px;
+    color:var(--muted); cursor:pointer; padding:40px; text-align:center; min-height:220px;
+  }
+  .dropzone:hover{ border-color: var(--accent); color:var(--text); }
+  .dropzone strong{ color:var(--text); font-weight:600; font-size:15px; }
+  .dropzone small{ font-size:12px; }
+
+  video{
+    width:100%; max-height:44vh; background:#000; border-radius:10px; display:block;
+  }
+
+  .transport{
+    display:flex; align-items:center; gap:12px;
+  }
+  .transport button{
+    background:var(--panel-2); border:1px solid var(--line); color:var(--text);
+    width:36px; height:36px; border-radius:8px; cursor:pointer; font-size:14px;
+    display:flex; align-items:center; justify-content:center;
+  }
+  .transport button:hover{ border-color:var(--accent); }
+  .timecode{
+    font-variant-numeric: tabular-nums; font-size:13px; color:var(--muted); min-width:150px;
+  }
+  .timecode b{ color:var(--text); font-weight:600; }
+
+  .timeline{
+    position:relative; height:64px; background:var(--panel); border:1px solid var(--line);
+    border-radius:8px; overflow:hidden; cursor:pointer;
+  }
+  .timeline .played{
+    position:absolute; top:0; bottom:0; left:0; background:rgba(227,161,61,0.10);
+  }
+  .timeline .range{
+    position:absolute; top:0; bottom:0; background:rgba(227,161,61,0.22);
+    border-left:2px solid var(--accent); border-right:2px solid var(--accent);
+  }
+  .timeline .playhead{
+    position:absolute; top:0; bottom:0; width:2px; background:var(--text);
+  }
+  .handle{
+    position:absolute; top:0; bottom:0; width:10px; margin-left:-5px;
+    cursor:ew-resize; z-index:3;
+  }
+  .handle::after{
+    content:''; position:absolute; left:50%; top:50%; transform:translate(-50%,-50%);
+    width:4px; height:24px; background:var(--accent); border-radius:2px;
+  }
+
+  .clip-row{
+    display:flex; align-items:center; gap:10px; flex-wrap:wrap;
+  }
+  .clip-row button.primary{
+    background:var(--accent); color:#1a1206; border:none; font-weight:600;
+    padding:9px 16px; border-radius:8px; cursor:pointer; font-size:13px;
+  }
+  .clip-row button.primary:disabled{ background:var(--accent-dim); color:#8a7754; cursor:not-allowed; }
+  .clip-row button.ghost{
+    background:transparent; border:1px solid var(--line); color:var(--text);
+    padding:9px 14px; border-radius:8px; cursor:pointer; font-size:13px;
+  }
+  .clip-row button.ghost:hover{ border-color:var(--accent); }
+
+  aside{
+    border-left:1px solid var(--line); padding:24px 22px; display:flex; flex-direction:column; gap:20px;
+    background:var(--panel);
+  }
+  aside h2{
+    font-size:12px; text-transform:none; color:var(--muted); margin:0 0 4px 0; font-weight:600;
+  }
+  .queue{
+    display:flex; flex-direction:column; gap:8px; max-height:220px; overflow:auto;
+  }
+  .queue-item{
+    background:var(--panel-2); border:1px solid var(--line); border-radius:8px;
+    padding:9px 11px; display:flex; justify-content:space-between; align-items:center; font-size:12.5px;
+  }
+  .queue-item button{
+    background:none; border:none; color:var(--muted); cursor:pointer; font-size:13px;
+  }
+  .queue-item button:hover{ color:var(--danger); }
+  .queue-empty{ color:var(--muted); font-size:12.5px; }
+
+  select, .field{
+    width:100%; background:var(--panel-2); border:1px solid var(--line); color:var(--text);
+    padding:9px 10px; border-radius:8px; font-size:13px;
+  }
+  label.small{ font-size:12px; color:var(--muted); display:block; margin-bottom:6px; }
+
+  .export-btn{
+    background:var(--accent); color:#1a1206; border:none; font-weight:600;
+    padding:12px 16px; border-radius:8px; cursor:pointer; font-size:13.5px; width:100%;
+  }
+  .export-btn:disabled{ background:var(--accent-dim); color:#8a7754; cursor:not-allowed; }
+
+  .log{
+    font-size:11.5px; color:var(--muted); background:var(--bg); border:1px solid var(--line);
+    border-radius:8px; padding:10px; max-height:120px; overflow:auto; white-space:pre-wrap;
+    font-variant-numeric: tabular-nums;
+  }
+  .status-dot{
+    display:inline-block; width:7px; height:7px; border-radius:50%; margin-right:6px; background:var(--muted);
+  }
+  .status-dot.ready{ background:var(--good); }
+  .status-dot.busy{ background:var(--accent); }
+
+  footer{
+    border-top:1px solid var(--line); padding:12px 28px; color:var(--muted); font-size:11.5px;
+  }
+  a{ color: var(--accent); }
+</style>
+</head>
+<body>
+
+<header>
+  <div>
+    <h1>Reel<span>cut</span></h1>
+  </div>
+  <p id="engineStatus"><span class="status-dot"></span>Menyiapkan mesin video…</p>
+</header>
+
+<main>
+  <section class="stage">
+    <div id="dropzone" class="dropzone">
+      <strong>Taruh video di sini, atau klik untuk pilih file</strong>
+      <small>Diproses langsung di browser kamu — tidak diunggah ke server mana pun</small>
+      <input id="fileInput" type="file" accept="video/*" style="display:none">
+    </div>
+
+    <video id="player" style="display:none" playsinline></video>
+
+    <div id="editorControls" style="display:none; flex-direction:column; gap:14px;">
+      <div class="transport">
+        <button id="playBtn" title="Putar/Jeda">▶</button>
+        <div class="timecode"><b id="curTime">00:00.0</b> / <span id="totalTime">00:00.0</span></div>
+      </div>
+
+      <div class="timeline" id="timeline">
+        <div class="played" id="played"></div>
+        <div class="range" id="range"></div>
+        <div class="playhead" id="playhead"></div>
+        <div class="handle" id="handleIn"></div>
+        <div class="handle" id="handleOut"></div>
+      </div>
+
+      <div class="clip-row">
+        <button class="ghost" id="setIn">Tandai awal di sini</button>
+        <button class="ghost" id="setOut">Tandai akhir di sini</button>
+        <button class="primary" id="addClip">+ Tambah potongan ke daftar</button>
+      </div>
+    </div>
+  </section>
+
+  <aside>
+    <div>
+      <h2>Daftar potongan</h2>
+      <div class="queue" id="queue">
+        <div class="queue-empty">Belum ada potongan. Tandai awal &amp; akhir, lalu tambahkan.</div>
+      </div>
+    </div>
+
+    <div>
+      <label class="small" for="modeSelect">Mode ekspor</label>
+      <select id="modeSelect">
+        <option value="single">Potong satu klip terpilih</option>
+        <option value="merge">Gabung semua potongan jadi satu video</option>
+      </select>
+    </div>
+
+    <div id="transitionField" style="display:none;">
+      <label class="small" for="transitionSelect">Transisi antar klip</label>
+      <select id="transitionSelect">
+        <option value="none">Tanpa transisi (potong langsung)</option>
+        <option value="fade" selected>Crossfade (video &amp; audio)</option>
+      </select>
+      <div id="transitionDurRow" style="margin-top:8px;">
+        <label class="small">Durasi transisi: <span id="transitionDurVal">0.6</span>d</label>
+        <input type="range" id="transitionDur" min="0.2" max="1.5" step="0.1" value="0.6" style="width:100%;">
+      </div>
+    </div>
+
+    <div>
+      <label class="small" for="formatSelect">Format keluaran</label>
+      <select id="formatSelect">
+        <option value="mp4">MP4 (paling kompatibel)</option>
+        <option value="webm">WebM</option>
+        <option value="gif">GIF (klip pendek)</option>
+      </select>
+    </div>
+
+    <div>
+      <label class="small" for="captionInput">Teks overlay (opsional)</label>
+      <input class="field" id="captionInput" placeholder="Contoh: Sale Hari Ini!">
+    </div>
+
+    <div id="captionOptions" style="display:none;">
+      <div style="display:flex; gap:10px; margin-bottom:10px;">
+        <div style="flex:1;">
+          <label class="small" for="captionPosition">Posisi</label>
+          <select id="captionPosition">
+            <option value="bottom">Bawah</option>
+            <option value="center">Tengah</option>
+            <option value="top">Atas</option>
+          </select>
+        </div>
+        <div style="width:64px;">
+          <label class="small" for="captionColor">Warna</label>
+          <input type="color" id="captionColor" value="#ffffff" style="width:100%; height:36px; padding:2px; border-radius:8px; border:1px solid var(--line); background:var(--panel-2);">
+        </div>
+      </div>
+      <label class="small">Ukuran teks: <span id="captionSizeVal">32</span>px</label>
+      <input type="range" id="captionSize" min="16" max="72" step="2" value="32" style="width:100%;">
+    </div>
+
+    <button class="export-btn" id="exportBtn" disabled>Proses & Unduh</button>
+
+    <div class="log" id="log">Menunggu file video…</div>
+  </aside>
+</main>
+
+<footer>
+  Reelcut berjalan sepenuhnya di perangkatmu lewat WebAssembly (ffmpeg.wasm). Simpan file ini dan buka kapan pun — tidak ada kuota, langganan, atau token yang habis.
+</footer>
+
+<script src="https://unpkg.com/@ffmpeg/ffmpeg@0.11.6/dist/ffmpeg.min.js"></script>
+<script>
+const { createFFmpeg, fetchFile } = FFmpeg;
+const ffmpeg = createFFmpeg({
+  log: true,
+  corePath: 'https://unpkg.com/@ffmpeg/core@0.11.0/dist/ffmpeg-core.js',
+});
+
+const engineStatus = document.getElementById('engineStatus');
+const logEl = document.getElementById('log');
+function logLine(msg){
+  logEl.textContent += '\n' + msg;
+  logEl.scrollTop = logEl.scrollHeight;
+}
+
+let ready = false;
+(async () => {
+  try{
+    await ffmpeg.load();
+    ready = true;
+    engineStatus.innerHTML = '<span class="status-dot ready"></span>Mesin video siap';
+    logLine('Mesin video (ffmpeg) siap digunakan.');
+  }catch(e){
+    engineStatus.innerHTML = '<span class="status-dot" style="background:var(--danger)"></span>Gagal memuat mesin video';
+    logLine('Gagal memuat ffmpeg.wasm: ' + e.message + '. Coba muat ulang halaman atau cek koneksi internet (dibutuhkan sekali saat pertama buka).');
+  }
+})();
+
+// ---- Elements
+const dropzone = document.getElementById('dropzone');
+const fileInput = document.getElementById('fileInput');
+const player = document.getElementById('player');
+const editorControls = document.getElementById('editorControls');
+const playBtn = document.getElementById('playBtn');
+const curTimeEl = document.getElementById('curTime');
+const totalTimeEl = document.getElementById('totalTime');
+const timeline = document.getElementById('timeline');
+const playedEl = document.getElementById('played');
+const rangeEl = document.getElementById('range');
+const playheadEl = document.getElementById('playhead');
+const handleIn = document.getElementById('handleIn');
+const handleOut = document.getElementById('handleOut');
+const setInBtn = document.getElementById('setIn');
+const setOutBtn = document.getElementById('setOut');
+const addClipBtn = document.getElementById('addClip');
+const queueEl = document.getElementById('queue');
+const exportBtn = document.getElementById('exportBtn');
+const modeSelect = document.getElementById('modeSelect');
+const formatSelect = document.getElementById('formatSelect');
+const captionInput = document.getElementById('captionInput');
+const captionOptions = document.getElementById('captionOptions');
+const captionPosition = document.getElementById('captionPosition');
+const captionColor = document.getElementById('captionColor');
+const captionSize = document.getElementById('captionSize');
+const captionSizeVal = document.getElementById('captionSizeVal');
+const transitionField = document.getElementById('transitionField');
+const transitionSelect = document.getElementById('transitionSelect');
+const transitionDur = document.getElementById('transitionDur');
+const transitionDurVal = document.getElementById('transitionDurVal');
+
+captionSize.addEventListener('input', () => { captionSizeVal.textContent = captionSize.value; });
+transitionDur.addEventListener('input', () => { transitionDurVal.textContent = transitionDur.value; });
+modeSelect.addEventListener('change', updateFieldVisibility);
+function updateFieldVisibility(){
+  transitionField.style.display = (modeSelect.value === 'merge') ? 'block' : 'none';
+}
+
+const FONT_URL = 'https://cdn.jsdelivr.net/gh/googlefonts/roboto-2@main/src/hinted/Roboto-Regular.ttf';
+let fontReady = false;
+async function ensureFont(){
+  if(fontReady) return;
+  try{
+    ffmpeg.FS('writeFile', 'font.ttf', await fetchFile(FONT_URL));
+    fontReady = true;
+  }catch(e){
+    logLine('Tidak bisa memuat font untuk teks overlay: ' + e.message);
+  }
+}
+
+let duration = 0;
+let inPoint = 0, outPoint = 0;
+let clips = []; // {inPoint, outPoint}
+let sourceFile = null;
+let sourceName = 'input.mp4';
+
+function fmt(t){
+  if(!isFinite(t)) t = 0;
+  const m = Math.floor(t/60);
+  const s = (t%60).toFixed(1).padStart(4,'0');
+  return String(m).padStart(2,'0') + ':' + s;
+}
+
+dropzone.addEventListener('click', () => fileInput.click());
+dropzone.addEventListener('dragover', e => { e.preventDefault(); });
+dropzone.addEventListener('drop', e => {
+  e.preventDefault();
+  if(e.dataTransfer.files[0]) loadFile(e.dataTransfer.files[0]);
+});
+fileInput.addEventListener('change', e => {
+  if(e.target.files[0]) loadFile(e.target.files[0]);
+});
+
+function loadFile(file){
+  sourceFile = file;
+  sourceName = file.name.replace(/[^a-zA-Z0-9._-]/g,'_');
+  const url = URL.createObjectURL(file);
+  player.src = url;
+  player.style.display = 'block';
+  dropzone.style.display = 'none';
+  editorControls.style.display = 'flex';
+  captionOptions.style.display = 'block';
+  exportBtn.disabled = !ready;
+  updateFieldVisibility();
+  logLine('File dimuat: ' + file.name);
+}
+
+player.addEventListener('loadedmetadata', () => {
+  duration = player.duration;
+  inPoint = 0;
+  outPoint = duration;
+  totalTimeEl.textContent = fmt(duration);
+  updateTimelineUI();
+});
+
+player.addEventListener('timeupdate', () => {
+  curTimeEl.textContent = fmt(player.currentTime);
+  const pct = (player.currentTime/duration)*100;
+  playheadEl.style.left = pct + '%';
+  playedEl.style.width = pct + '%';
+});
+
+playBtn.addEventListener('click', () => {
+  if(player.paused){ player.play(); playBtn.textContent = '❚❚'; }
+  else { player.pause(); playBtn.textContent = '▶'; }
+});
+
+function updateTimelineUI(){
+  const left = (inPoint/duration)*100;
+  const right = (outPoint/duration)*100;
+  rangeEl.style.left = left + '%';
+  rangeEl.style.width = (right-left) + '%';
+  handleIn.style.left = left + '%';
+  handleOut.style.left = right + '%';
+}
+
+timeline.addEventListener('click', (e) => {
+  if(e.target === handleIn || e.target === handleOut) return;
+  const rect = timeline.getBoundingClientRect();
+  const pct = (e.clientX - rect.left)/rect.width;
+  player.currentTime = Math.max(0, Math.min(duration, pct*duration));
+});
+
+function makeDraggable(handle, isIn){
+  handle.addEventListener('mousedown', (e) => {
+    e.stopPropagation();
+    const rect = timeline.getBoundingClientRect();
+    function onMove(ev){
+      let pct = (ev.clientX - rect.left)/rect.width;
+      pct = Math.max(0, Math.min(1, pct));
+      const t = pct*duration;
+      if(isIn){ inPoint = Math.min(t, outPoint-0.1); }
+      else { outPoint = Math.max(t, inPoint+0.1); }
+      updateTimelineUI();
+    }
+    function onUp(){
+      document.removeEventListener('mousemove', onMove);
+      document.removeEventListener('mouseup', onUp);
+    }
+    document.addEventListener('mousemove', onMove);
+    document.addEventListener('mouseup', onUp);
+  });
+}
+makeDraggable(handleIn, true);
+makeDraggable(handleOut, false);
+
+setInBtn.addEventListener('click', () => {
+  inPoint = Math.min(player.currentTime, outPoint-0.1);
+  updateTimelineUI();
+});
+setOutBtn.addEventListener('click', () => {
+  outPoint = Math.max(player.currentTime, inPoint+0.1);
+  updateTimelineUI();
+});
+
+function renderQueue(){
+  if(clips.length === 0){
+    queueEl.innerHTML = '<div class="queue-empty">Belum ada potongan. Tandai awal &amp; akhir, lalu tambahkan.</div>';
+    exportBtn.disabled = !ready;
+    return;
+  }
+  queueEl.innerHTML = '';
+  clips.forEach((c, i) => {
+    const row = document.createElement('div');
+    row.className = 'queue-item';
+    row.innerHTML = `<span>Klip ${i+1}: ${fmt(c.inPoint)} – ${fmt(c.outPoint)}</span>`;
+    const del = document.createElement('button');
+    del.textContent = '✕';
+    del.addEventListener('click', () => { clips.splice(i,1); renderQueue(); });
+    row.appendChild(del);
+    queueEl.appendChild(row);
+  });
+  exportBtn.disabled = !ready;
+}
+
+addClipBtn.addEventListener('click', () => {
+  clips.push({ inPoint, outPoint });
+  renderQueue();
+  logLine(`Potongan ditambahkan: ${fmt(inPoint)} – ${fmt(outPoint)}`);
+});
+
+exportBtn.addEventListener('click', async () => {
+  if(!ready || !sourceFile) return;
+  exportBtn.disabled = true;
+  exportBtn.textContent = 'Memproses…';
+  engineStatus.innerHTML = '<span class="status-dot busy"></span>Sedang memproses video…';
+
+  try{
+    ffmpeg.FS('writeFile', sourceName, await fetchFile(sourceFile));
+
+    const format = formatSelect.value;
+    const caption = captionInput.value.trim();
+    const mode = modeSelect.value;
+    const outName = 'output.' + format;
+
+    if(caption) await ensureFont();
+
+    const vfFilters = [];
+    if(format === 'gif'){
+      vfFilters.push('fps=12,scale=480:-1:flags=lanczos');
+    }
+    if(caption){
+      const safeText = caption.replace(/\\/g,'\\\\').replace(/'/g, "\\'").replace(/:/g, '\\:');
+      const size = captionSize.value;
+      const color = captionColor.value;
+      let yExpr = 'h-text_h-40';
+      if(captionPosition.value === 'top') yExpr = '40';
+      if(captionPosition.value === 'center') yExpr = '(h-text_h)/2';
+      const fontfileArg = fontReady ? "fontfile='/font.ttf':" : '';
+      vfFilters.push(`drawtext=${fontfileArg}text='${safeText}':fontcolor=${color}:fontsize=${size}:borderw=2:bordercolor=black:x=(w-text_w)/2:y=${yExpr}`);
+    }
+    const vf = vfFilters.length ? ['-vf', vfFilters.join(',')] : [];
+
+    if(mode === 'single' || clips.length <= 1){
+      const seg = clips.length ? clips[0] : { inPoint, outPoint };
+      logLine(`Memotong ${fmt(seg.inPoint)} – ${fmt(seg.outPoint)}…`);
+      await ffmpeg.run(
+        '-ss', String(seg.inPoint), '-to', String(seg.outPoint),
+        '-i', sourceName, ...vf,
+        ...(format === 'mp4' ? ['-c:v','libx264','-c:a','aac'] : []),
+        outName
+      );
+    } else {
+      // trim each clip first
+      const partDurations = [];
+      for(let i=0;i<clips.length;i++){
+        const seg = clips[i];
+        const partName = `part${i}.mp4`;
+        logLine(`Memotong klip ${i+1}/${clips.length}…`);
+        await ffmpeg.run(
+          '-ss', String(seg.inPoint), '-to', String(seg.outPoint),
+          '-i', sourceName, '-c:v','libx264','-c:a','aac',
+          partName
+        );
+        partDurations.push(seg.outPoint - seg.inPoint);
+      }
+
+      const wantTransition = transitionSelect.value === 'fade' && clips.length > 1;
+      const T = parseFloat(transitionDur.value);
+      const canTransition = wantTransition && partDurations.every(d => d > T * 1.2);
+
+      if(canTransition){
+        logLine('Menggabungkan klip dengan crossfade…');
+        const inputArgs = [];
+        for(let i=0;i<clips.length;i++){ inputArgs.push('-i', `part${i}.mp4`); }
+
+        let filterV = '', filterA = '';
+        let prevV = '0:v', prevA = '0:a';
+        let cum = partDurations[0];
+        for(let i=1;i<clips.length;i++){
+          const offset = Math.max(0, cum - T);
+          const vLabel = `v${i}`, aLabel = `a${i}`;
+          filterV += `[${prevV}][${i}:v]xfade=transition=fade:duration=${T}:offset=${offset.toFixed(2)}[${vLabel}];`;
+          filterA += `[${prevA}][${i}:a]acrossfade=d=${T}[${aLabel}];`;
+          cum = cum + partDurations[i] - T;
+          prevV = vLabel; prevA = aLabel;
+        }
+        const filterComplex = filterV + filterA;
+        await ffmpeg.run(
+          ...inputArgs,
+          '-filter_complex', filterComplex,
+          '-map', `[${prevV}]`, '-map', `[${prevA}]`,
+          'concat_out.mp4'
+        );
+      } else {
+        if(wantTransition) logLine('Klip terlalu pendek untuk transisi ini, digabung tanpa transisi.');
+        let listContent = '';
+        for(let i=0;i<clips.length;i++) listContent += `file 'part${i}.mp4'\n`;
+        ffmpeg.FS('writeFile', 'list.txt', listContent);
+        logLine('Menggabungkan semua klip…');
+        await ffmpeg.run('-f','concat','-safe','0','-i','list.txt','-c','copy','concat_out.mp4');
+      }
+
+      if(vf.length || format !== 'mp4'){
+        await ffmpeg.run('-i','concat_out.mp4', ...vf,
+          ...(format === 'mp4' ? ['-c:v','libx264','-c:a','aac'] : []),
+          outName);
+      } else {
+        await ffmpeg.run('-i','concat_out.mp4','-c','copy', outName);
+      }
+    }
+
+    const data = ffmpeg.FS('readFile', outName);
+    const mime = format === 'gif' ? 'image/gif' : (format === 'webm' ? 'video/webm' : 'video/mp4');
+    const blob = new Blob([data.buffer], { type: mime });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'reelcut-export.' + format;
+    a.click();
+
+    logLine('Selesai! File diunduh: reelcut-export.' + format);
+  }catch(err){
+    logLine('Terjadi error: ' + err.message);
+  }finally{
+    exportBtn.disabled = false;
+    exportBtn.textContent = 'Proses & Unduh';
+    engineStatus.innerHTML = '<span class="status-dot ready"></span>Mesin video siap';
+  }
+});
+</script>
+
+</body>
+</html>
