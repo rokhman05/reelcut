@@ -278,6 +278,10 @@
         <option value="9:16">9:16 vertikal (Reels/TikTok/Shorts)</option>
         <option value="1:1">1:1 kotak (Instagram feed)</option>
       </select>
+      <div id="smartCropField" style="display:none; align-items:center; gap:8px; margin-top:8px;">
+        <input type="checkbox" id="smartCropToggle" checked style="width:16px; height:16px;">
+        <label class="small" for="smartCropToggle" style="margin:0;">Ikuti wajah pembicara otomatis (deteksi wajah AI) agar tidak terpotong</label>
+      </div>
     </div>
 
     <div>
@@ -340,6 +344,7 @@
 </footer>
 
 <script src="https://unpkg.com/@ffmpeg/ffmpeg@0.11.6/dist/ffmpeg.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@vladmandic/face-api/dist/face-api.js"></script>
 <script type="module">
 import { pipeline, env } from 'https://cdn.jsdelivr.net/npm/@xenova/transformers@2.17.2';
 env.allowLocalModels = false;
@@ -427,6 +432,8 @@ const transitionSelect = document.getElementById('transitionSelect');
 const transitionDur = document.getElementById('transitionDur');
 const transitionDurVal = document.getElementById('transitionDurVal');
 const aspectSelect = document.getElementById('aspectSelect');
+const smartCropField = document.getElementById('smartCropField');
+const smartCropToggle = document.getElementById('smartCropToggle');
 const autoCaptionToggle = document.getElementById('autoCaptionToggle');
 const findHighlightsBtn = document.getElementById('findHighlights');
 const highlightResults = document.getElementById('highlightResults');
@@ -438,6 +445,11 @@ modeSelect.addEventListener('change', updateFieldVisibility);
 function updateFieldVisibility(){
   transitionField.style.display = (modeSelect.value === 'merge') ? 'block' : 'none';
 }
+aspectSelect.addEventListener('change', updateSmartCropVisibility);
+function updateSmartCropVisibility(){
+  smartCropField.style.display = (aspectSelect.value === 'original') ? 'none' : 'flex';
+}
+updateSmartCropVisibility();
 
 const FONT_URL = 'https://cdn.jsdelivr.net/gh/googlefonts/roboto-2@main/src/hinted/Roboto-Regular.ttf';
 let fontReady = false;
@@ -451,12 +463,85 @@ async function ensureFont(){
   }
 }
 
+// ---- Deteksi wajah otomatis untuk crop pintar (9:16 / 1:1)
+// Mengambil beberapa cuplikan frame dari klip, mendeteksi posisi wajah dengan model AI
+// ringan (TinyFaceDetector, ±190KB, jalan di browser), lalu memakai rata-rata posisinya
+// sebagai titik tengah crop. Kalau tidak ada wajah terdeteksi, otomatis kembali ke crop
+// tengah biasa seperti sebelumnya — jadi tidak akan lebih buruk dari perilaku lama.
+let faceModelReady = false;
+async function ensureFaceModel(){
+  if(faceModelReady) return;
+  transcriptStatus.style.display = 'block';
+  transcriptStatus.textContent = 'Memuat model deteksi wajah (sekali saja, ±190KB)…';
+  await faceapi.nets.tinyFaceDetector.loadFromUri('https://cdn.jsdelivr.net/npm/@vladmandic/face-api/model/');
+  faceModelReady = true;
+}
+
+async function detectFaceCenterX(seg){
+  try{
+    await ensureFaceModel();
+  }catch(e){
+    logLine('Model deteksi wajah gagal dimuat, pakai crop tengah biasa: ' + e.message);
+    return null;
+  }
+  const fracs = [0.25, 0.5, 0.75];
+  const centers = [];
+  for(let i=0;i<fracs.length;i++){
+    const t = seg.inPoint + (seg.outPoint - seg.inPoint) * fracs[i];
+    const frameName = `face_frame_${i}.jpg`;
+    try{
+      await ffmpeg.run('-ss', String(t), '-i', sourceName, '-frames:v','1','-q:v','4', frameName);
+      const data = ffmpeg.FS('readFile', frameName);
+      try{ ffmpeg.FS('unlink', frameName); }catch(e){}
+      const blob = new Blob([data.buffer], { type:'image/jpeg' });
+      const bitmap = await createImageBitmap(blob);
+      const canvas = document.createElement('canvas');
+      canvas.width = bitmap.width; canvas.height = bitmap.height;
+      canvas.getContext('2d').drawImage(bitmap, 0, 0);
+      const det = await faceapi.detectSingleFace(canvas, new faceapi.TinyFaceDetectorOptions());
+      if(det){
+        centers.push((det.box.x + det.box.width/2) / bitmap.width);
+      }
+    }catch(err){ /* lewati frame ini kalau gagal diekstrak/dideteksi */ }
+  }
+  if(centers.length === 0) return null; // tidak ada wajah terdeteksi -> fallback ke crop tengah
+  return centers.reduce((a,b)=>a+b,0)/centers.length;
+}
+
+// Menyusun filter crop, dengan titik tengah horizontal mengikuti posisi wajah kalau ada (centerXFrac 0..1),
+// atau tengah frame biasa kalau centerXFrac null.
+function buildCropFilter(aspect, iw, ih, centerXFrac){
+  if(aspect === '9:16'){
+    const cw = Math.min(iw, Math.round(ih * 9/16));
+    const cx = centerXFrac == null ? Math.round((iw-cw)/2) : Math.max(0, Math.min(iw-cw, Math.round(centerXFrac*iw - cw/2)));
+    return `crop=${cw}:${ih}:${cx}:0`;
+  }
+  if(aspect === '1:1'){
+    const cs = Math.min(iw, ih);
+    const cx = centerXFrac == null ? Math.round((iw-cs)/2) : Math.max(0, Math.min(iw-cs, Math.round(centerXFrac*iw - cs/2)));
+    const cy = Math.round((ih-cs)/2);
+    return `crop=${cs}:${cs}:${cx}:${cy}`;
+  }
+  return null;
+}
+
 let duration = 0;
 let inPoint = 0, outPoint = 0;
 let clips = []; // {inPoint, outPoint, caption, autoCaption}
 let sourceFile = null;
 let sourceName = 'input.mp4';
+let sourceLoadedInFS = false; // supaya file sumber cuma ditulis sekali ke memori ffmpeg, bukan setiap klik
 let busy = false; // mencegah dua proses ffmpeg berjalan bersamaan (export utama, pratinjau, atau unduh per-klip)
+
+// Menulis file sumber ke filesystem ffmpeg HANYA kalau belum ada di sana.
+// Sebelumnya setiap tombol (Pratinjau/Unduh/Cari momen/Auto-caption) menulis ulang
+// seluruh video dari awal setiap kali diklik — untuk video besar ini boros dan bikin
+// makin lambat setiap klip yang dicoba. Sekarang cukup sekali per video yang dimuat.
+async function ensureSourceInFS(){
+  if(sourceLoadedInFS) return;
+  ffmpeg.FS('writeFile', sourceName, await fetchFile(sourceFile));
+  sourceLoadedInFS = true;
+}
 
 function fmt(t){
   if(!isFinite(t)) t = 0;
@@ -478,6 +563,7 @@ fileInput.addEventListener('change', e => {
 function loadFile(file){
   sourceFile = file;
   sourceName = file.name.replace(/[^a-zA-Z0-9._-]/g,'_');
+  sourceLoadedInFS = false; // file baru -> perlu ditulis ulang ke ffmpeg sekali saat pertama dipakai
   const url = URL.createObjectURL(file);
   player.src = url;
   player.style.display = 'block';
@@ -653,17 +739,25 @@ async function runClipAction(clip, index, { isPreview, statusEl, previewVideo, b
 
   let outName = '';
   try{
-    ffmpeg.FS('writeFile', sourceName, await fetchFile(sourceFile));
+    await ensureSourceInFS();
 
     const aspect = aspectSelect.value;
     const format = isPreview ? 'mp4' : formatSelect.value;
     const preset = isPreview ? 'ultrafast' : speedSelect.value;
     const vfFilters = [];
 
-    if(aspect === '9:16'){
-      vfFilters.push('crop=ih*9/16:ih', isPreview ? 'scale=540:960' : 'scale=1080:1920');
-    } else if(aspect === '1:1'){
-      vfFilters.push('crop=ih:ih', isPreview ? 'scale=540:540' : 'scale=1080:1080');
+    if(aspect === '9:16' || aspect === '1:1'){
+      const iw = player.videoWidth || 1280, ih = player.videoHeight || 720;
+      let centerXFrac = null;
+      if(smartCropToggle.checked){
+        statusEl.textContent = 'Mendeteksi posisi wajah…';
+        centerXFrac = await detectFaceCenterX(clip);
+      }
+      const cropF = buildCropFilter(aspect, iw, ih, centerXFrac);
+      const targetScale = aspect === '9:16'
+        ? (isPreview ? 'scale=540:960' : 'scale=1080:1920')
+        : (isPreview ? 'scale=540:540' : 'scale=1080:1080');
+      vfFilters.push(cropF, targetScale);
     } else if(isPreview){
       vfFilters.push('scale=640:-2');
     }
@@ -784,11 +878,10 @@ findHighlightsBtn.addEventListener('click', async () => {
   highlightResults.innerHTML = '';
   try{
     logLine('Mengekstrak audio untuk analisis momen menarik…');
-    if(!ffmpeg.FS('readdir','/').includes(sourceName)){
-      ffmpeg.FS('writeFile', sourceName, await fetchFile(sourceFile));
-    }
+    await ensureSourceInFS();
     await ffmpeg.run('-i', sourceName, '-ar','16000','-ac','1','-f','wav','highlight_audio.wav');
     const wavData = ffmpeg.FS('readFile','highlight_audio.wav');
+    try{ ffmpeg.FS('unlink','highlight_audio.wav'); }catch(e){}
     const samples = await decodeWavTo16k(wavData);
     const sr = 16000;
     const windowSize = sr; // 1 detik
@@ -859,12 +952,13 @@ async function transcribeSegment(seg){
   transcriptStatus.style.display = 'block';
   transcriptStatus.textContent = 'Mengekstrak audio klip…';
   await ensureWhisper();
-  ffmpeg.FS('writeFile', sourceName, await fetchFile(sourceFile));
+  await ensureSourceInFS();
   await ffmpeg.run(
     '-ss', String(seg.inPoint), '-to', String(seg.outPoint),
     '-i', sourceName, '-ar','16000','-ac','1','-f','wav','caption_audio.wav'
   );
   const wavData = ffmpeg.FS('readFile','caption_audio.wav');
+  try{ ffmpeg.FS('unlink','caption_audio.wav'); }catch(e){}
   const samples = await decodeWavTo16k(wavData);
   transcriptStatus.textContent = 'Mentranskrip ucapan…';
   const result = await whisperPipeline(samples, { return_timestamps: true, chunk_length_s: 30, stride_length_s: 5 });
@@ -886,7 +980,7 @@ exportBtn.addEventListener('click', async () => {
   engineStatus.innerHTML = '<span class="status-dot busy"></span>Sedang memproses video…';
 
   try{
-    ffmpeg.FS('writeFile', sourceName, await fetchFile(sourceFile));
+    await ensureSourceInFS();
 
     const format = formatSelect.value;
     const speedPreset = speedSelect.value;
@@ -912,10 +1006,18 @@ exportBtn.addEventListener('click', async () => {
 
     const vfFilters = [];
 
-    if(aspect === '9:16'){
-      vfFilters.push('crop=ih*9/16:ih', 'scale=1080:1920');
-    } else if(aspect === '1:1'){
-      vfFilters.push('crop=ih:ih', 'scale=1080:1080');
+    if(aspect === '9:16' || aspect === '1:1'){
+      const iw = player.videoWidth || 1280, ih = player.videoHeight || 720;
+      let centerXFrac = null;
+      if(smartCropToggle.checked){
+        const seg = clips.length ? clips[0] : { inPoint, outPoint };
+        logLine('Mendeteksi posisi wajah untuk crop pintar…');
+        centerXFrac = await detectFaceCenterX(seg);
+      }
+      vfFilters.push(
+        buildCropFilter(aspect, iw, ih, centerXFrac),
+        aspect === '9:16' ? 'scale=1080:1920' : 'scale=1080:1080'
+      );
     }
 
     if(format === 'gif'){
