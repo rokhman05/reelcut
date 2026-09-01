@@ -282,6 +282,10 @@
         <input type="checkbox" id="smartCropToggle" checked style="width:16px; height:16px;">
         <label class="small" for="smartCropToggle" style="margin:0;">Ikuti wajah pembicara otomatis (deteksi wajah AI) agar tidak terpotong</label>
       </div>
+      <div id="collageField" style="display:none; align-items:center; gap:8px; margin-top:8px;">
+        <input type="checkbox" id="collageToggle" style="width:16px; height:16px;">
+        <label class="small" for="collageToggle" style="margin:0;">Mode kolase — kalau ada beberapa orang sekaligus di frame (maks 4), tampilkan semuanya berdampingan, bukan crop ke satu orang</label>
+      </div>
     </div>
 
     <div>
@@ -300,6 +304,16 @@
         <option value="veryfast" selected>Seimbang (disarankan)</option>
         <option value="medium">Kualitas lebih tinggi (lebih lambat)</option>
       </select>
+    </div>
+
+    <div>
+      <label class="small" for="resolutionSelect">Resolusi keluaran</label>
+      <select id="resolutionSelect">
+        <option value="480">Tercepat (480p) — untuk tes cepat/pratinjau</option>
+        <option value="720" selected>Cepat (720p) — disarankan untuk Reels/TikTok</option>
+        <option value="1080">Tinggi (1080p) — paling lambat</option>
+      </select>
+      <div style="color:var(--muted); font-size:11px; margin-top:4px;">Ini pengaruhnya JAUH lebih besar ke kecepatan dibanding pilihan "Kecepatan proses" di atas — resolusi lebih rendah = proses jauh lebih cepat.</div>
     </div>
 
     <div id="autoCaptionField" style="display:flex; align-items:center; gap:8px;">
@@ -421,6 +435,32 @@ const exportBtn = document.getElementById('exportBtn');
 const modeSelect = document.getElementById('modeSelect');
 const formatSelect = document.getElementById('formatSelect');
 const speedSelect = document.getElementById('speedSelect');
+const resolutionSelect = document.getElementById('resolutionSelect');
+
+// Pakai semua core CPU yang tersedia secara eksplisit (sisakan 1 core biar UI tidak macet).
+const threadArgs = supportsThreads ? ['-threads', String(threadCount)] : [];
+
+// Target lebar/tinggi keluaran berdasar pilihan resolusi — ini pengaruhnya jauh lebih besar
+// ke kecepatan proses dibanding preset x264 saja, terutama kalau video sumber 1080p/4K.
+const RESOLUTION_MAP = {
+  '480': { vertical:[480,854], square:[480,480], originalCapWidth:854 },
+  '720': { vertical:[720,1280], square:[720,720], originalCapWidth:1280 },
+  '1080':{ vertical:[1080,1920], square:[1080,1080], originalCapWidth:1920 },
+};
+function getTargetDims(resTier, aspect){
+  const t = RESOLUTION_MAP[resTier] || RESOLUTION_MAP['720'];
+  if(aspect === '9:16') return t.vertical;
+  if(aspect === '1:1') return t.square;
+  return null;
+}
+function getScaleTarget(resTier, aspect){
+  if(aspect === '9:16' || aspect === '1:1'){
+    const [w,h] = getTargetDims(resTier, aspect);
+    return `scale=${w}:${h}`;
+  }
+  const t = RESOLUTION_MAP[resTier] || RESOLUTION_MAP['720'];
+  return `scale='min(${t.originalCapWidth},iw)':-2`; // rasio asli, tetap dibatasi biar tidak proses di resolusi sumber yang mungkin sangat besar
+}
 const captionInput = document.getElementById('captionInput');
 const captionOptions = document.getElementById('captionOptions');
 const captionPosition = document.getElementById('captionPosition');
@@ -434,6 +474,8 @@ const transitionDurVal = document.getElementById('transitionDurVal');
 const aspectSelect = document.getElementById('aspectSelect');
 const smartCropField = document.getElementById('smartCropField');
 const smartCropToggle = document.getElementById('smartCropToggle');
+const collageField = document.getElementById('collageField');
+const collageToggle = document.getElementById('collageToggle');
 const autoCaptionToggle = document.getElementById('autoCaptionToggle');
 const findHighlightsBtn = document.getElementById('findHighlights');
 const highlightResults = document.getElementById('highlightResults');
@@ -447,7 +489,9 @@ function updateFieldVisibility(){
 }
 aspectSelect.addEventListener('change', updateSmartCropVisibility);
 function updateSmartCropVisibility(){
-  smartCropField.style.display = (aspectSelect.value === 'original') ? 'none' : 'flex';
+  const show = aspectSelect.value !== 'original';
+  smartCropField.style.display = show ? 'flex' : 'none';
+  collageField.style.display = show ? 'flex' : 'none';
 }
 updateSmartCropVisibility();
 
@@ -465,9 +509,8 @@ async function ensureFont(){
 
 // ---- Deteksi wajah otomatis untuk crop pintar (9:16 / 1:1)
 // Mengambil beberapa cuplikan frame dari klip, mendeteksi posisi wajah dengan model AI
-// ringan (TinyFaceDetector, ±190KB, jalan di browser), lalu memakai rata-rata posisinya
-// sebagai titik tengah crop. Kalau tidak ada wajah terdeteksi, otomatis kembali ke crop
-// tengah biasa seperti sebelumnya — jadi tidak akan lebih buruk dari perilaku lama.
+// ringan (TinyFaceDetector, ±190KB, jalan di browser), lalu mengelompokkan posisinya.
+// Kalau tidak ada wajah terdeteksi, otomatis kembali ke crop tengah biasa seperti sebelumnya.
 let faceModelReady = false;
 async function ensureFaceModel(){
   if(faceModelReady) return;
@@ -477,15 +520,30 @@ async function ensureFaceModel(){
   faceModelReady = true;
 }
 
-async function detectFaceCenterX(seg){
+// Opsi deteksi yang lebih sensitif: inputSize lebih besar (menangkap wajah kecil/agak jauh
+// dari kamera) dan scoreThreshold diturunkan (menangkap wajah yang kurang menghadap kamera
+// langsung, pencahayaan kurang ideal, dsb). Trade-off: sedikit lebih lambat & mungkin ada
+// false-positive sesekali, tapi lebih jarang "kelewatan" orang yang sebenarnya ada di frame.
+function faceDetectOptions(){
+  return new faceapi.TinyFaceDetectorOptions({ inputSize: 512, scoreThreshold: 0.3 });
+}
+
+// Mendeteksi SEMUA wajah di beberapa cuplikan frame sepanjang klip, lalu mengelompokkan
+// deteksi yang posisinya berdekatan sebagai "orang yang sama" — ini heuristik berbasis
+// posisi horizontal di frame, BUKAN pengenalan wajah/identitas asli. Jadi kalau seseorang
+// berpindah tempat drastis di tengah klip, bisa saja terhitung sebagai 2 klaster berbeda.
+// Hanya klaster yang muncul di ≥2 dari 5 frame sampel yang dianggap "orang yang stabil ada
+// di frame" (menyaring deteksi sekali-doang yang mungkin salah/silau/dsb).
+async function detectFaceClusters(seg){
   try{
     await ensureFaceModel();
   }catch(e){
     logLine('Model deteksi wajah gagal dimuat, pakai crop tengah biasa: ' + e.message);
-    return null;
+    return [];
   }
-  const fracs = [0.25, 0.5, 0.75];
-  const allFaces = []; // {cx, area} dari SEMUA wajah di SEMUA frame sampel, bukan cuma satu
+  const fracs = [0.1, 0.3, 0.5, 0.7, 0.9];
+  const options = faceDetectOptions();
+  const raw = []; // {cx, area} dari semua wajah di semua frame sampel
   for(let i=0;i<fracs.length;i++){
     const t = seg.inPoint + (seg.outPoint - seg.inPoint) * fracs[i];
     const frameName = `face_frame_${i}.jpg`;
@@ -498,30 +556,83 @@ async function detectFaceCenterX(seg){
       const canvas = document.createElement('canvas');
       canvas.width = bitmap.width; canvas.height = bitmap.height;
       canvas.getContext('2d').drawImage(bitmap, 0, 0);
-      // detectAllFaces, bukan detectSingleFace -> kalau ada beberapa orang bicara bersamaan,
-      // semuanya ikut dihitung, bukan cuma satu yang kebetulan paling pede terdeteksi.
-      const dets = await faceapi.detectAllFaces(canvas, new faceapi.TinyFaceDetectorOptions());
-      dets.forEach(det => {
-        allFaces.push({
-          cx: (det.box.x + det.box.width/2) / bitmap.width,
-          area: det.box.width * det.box.height
-        });
-      });
+      const dets = await faceapi.detectAllFaces(canvas, options);
+      dets.forEach(det => raw.push({
+        cx: (det.box.x + det.box.width/2) / bitmap.width,
+        area: det.box.width * det.box.height
+      }));
     }catch(err){ /* lewati frame ini kalau gagal diekstrak/dideteksi */ }
   }
-  if(allFaces.length === 0) return null; // tidak ada wajah terdeteksi -> fallback ke crop tengah
+  if(raw.length === 0) return [];
 
-  // Titik tengah crop = rata-rata posisi SEMUA wajah, dibobot ukurannya (wajah yang lebih besar/
-  // dekat kamera biasanya subjek utama, jadi pengaruhnya lebih besar ke posisi crop).
-  const totalArea = allFaces.reduce((a,f)=>a+f.area,0);
-  const weightedCenter = allFaces.reduce((a,f)=>a + f.cx*f.area, 0) / totalArea;
+  raw.sort((a,b)=>a.cx-b.cx);
+  const clusters = [];
+  raw.forEach(f => {
+    const last = clusters[clusters.length-1];
+    if(last && (f.cx - last.avgCx) < 0.14){
+      last.items.push(f);
+      last.avgCx = last.items.reduce((a,x)=>a+x.cx,0)/last.items.length;
+    } else {
+      clusters.push({ avgCx: f.cx, items:[f] });
+    }
+  });
 
-  const xs = allFaces.map(f=>f.cx);
-  const spread = Math.max(...xs) - Math.min(...xs);
-  if(allFaces.length > fracs.length && spread > 0.5){
-    logLine('Beberapa wajah terdeteksi cukup berjauhan — crop vertikal mungkin tidak bisa memuat semuanya sekaligus, dipusatkan di rata-rata posisi.');
+  const stable = clusters.filter(c => c.items.length >= 2);
+  const chosen = stable.length ? stable : clusters; // kalau tidak ada yang stabil, tetap pakai apa adanya daripada kosong
+
+  return chosen
+    .map(c => ({
+      cx: c.avgCx,
+      occurrence: c.items.length,
+      area: c.items.reduce((a,x)=>a+x.area,0)/c.items.length
+    }))
+    .sort((a,b) => (b.occurrence - a.occurrence) || (b.area - a.area))
+    .slice(0, 4) // dibatasi maksimal 4 orang untuk kolase supaya tata letak tetap wajar
+    .sort((a,b) => a.cx - b.cx); // urutkan lagi kiri->kanan biar susunan kolase natural sesuai posisi asli
+}
+
+// Wrapper lama untuk crop satu-orang: tetap dipakai kalau kolase nonaktif atau cuma 1 orang terdeteksi.
+async function detectFaceCenterX(seg){
+  const clusters = await detectFaceClusters(seg);
+  if(clusters.length === 0) return null;
+  const totalWeight = clusters.reduce((a,c)=>a + c.occurrence*c.area, 0);
+  const weighted = clusters.reduce((a,c)=>a + c.cx*c.occurrence*c.area, 0) / totalWeight;
+  if(clusters.length > 1){
+    const spread = clusters[clusters.length-1].cx - clusters[0].cx;
+    if(spread > 0.5){
+      logLine('Beberapa wajah terdeteksi cukup berjauhan — crop vertikal mungkin tidak bisa memuat semuanya sekaligus, dipusatkan di rata-rata posisi. Aktifkan mode kolase kalau ingin semua orang tetap tampil.');
+    }
   }
-  return weightedCenter;
+  return weighted;
+}
+
+function evenize(n){ return n % 2 === 0 ? n : n - 1; }
+
+// Menyusun filter_complex untuk kolase: video sumber di-duplikat sebanyak jumlah orang
+// terdeteksi (maks 4), tiap salinan di-crop berpusat pada posisi orang itu, lalu disusun
+// jadi grid (2 orang = tumpuk atas-bawah, 3 orang = 3 baris, 4 orang = grid 2x2).
+function buildCollageFilterComplex(clusters, iw, ih, outW, outH){
+  const n = Math.min(clusters.length, 4);
+  const used = clusters.slice(0, n);
+  const cols = n === 4 ? 2 : 1;
+  const rows = n === 4 ? 2 : n;
+  const panelW = evenize(Math.floor(outW / cols));
+  const panelH = evenize(Math.floor(outH / rows));
+
+  let filter = `[0:v]split=${n}` + used.map((_,i)=>`[cs${i}]`).join('') + ';';
+  const labels = [];
+  used.forEach((c, i) => {
+    const cw = evenize(Math.max(2, Math.min(iw, Math.round(ih * panelW / panelH))));
+    const cx = Math.max(0, Math.min(iw-cw, Math.round(c.cx*iw - cw/2)));
+    filter += `[cs${i}]crop=${cw}:${ih}:${cx}:0,scale=${panelW}:${panelH}[cp${i}];`;
+    labels.push(`cp${i}`);
+  });
+  const layoutParts = labels.map((_,i)=>{
+    const row = Math.floor(i/cols), col = i%cols;
+    return `${col*panelW}_${row*panelH}`;
+  });
+  filter += labels.map(l=>`[${l}]`).join('') + `xstack=inputs=${n}:layout=${layoutParts.join('|')}[vcollage]`;
+  return { filterComplex: filter, width: cols*panelW, height: rows*panelH };
 }
 
 // Menyusun filter crop, dengan titik tengah horizontal mengikuti posisi wajah kalau ada (centerXFrac 0..1),
@@ -762,25 +873,7 @@ async function runClipAction(clip, index, { isPreview, statusEl, previewVideo, b
     const preset = isPreview ? 'ultrafast' : speedSelect.value;
     const vfFilters = [];
 
-    if(aspect === '9:16' || aspect === '1:1'){
-      const iw = player.videoWidth || 1280, ih = player.videoHeight || 720;
-      let centerXFrac = null;
-      if(smartCropToggle.checked){
-        statusEl.textContent = 'Mendeteksi posisi wajah…';
-        centerXFrac = await detectFaceCenterX(clip);
-      }
-      const cropF = buildCropFilter(aspect, iw, ih, centerXFrac);
-      const targetScale = aspect === '9:16'
-        ? (isPreview ? 'scale=540:960' : 'scale=1080:1920')
-        : (isPreview ? 'scale=540:540' : 'scale=1080:1080');
-      vfFilters.push(cropF, targetScale);
-    } else if(isPreview){
-      vfFilters.push('scale=640:-2');
-    }
-    if(format === 'gif'){
-      vfFilters.push('fps=12,scale=480:-1:flags=lanczos');
-    }
-
+    // Siapkan filter caption terlebih dulu (dipakai baik di jalur normal maupun jalur kolase)
     const size = captionSize.value;
     const color = captionColor.value;
     let yExpr = 'h-text_h-40';
@@ -797,26 +890,89 @@ async function runClipAction(clip, index, { isPreview, statusEl, previewVideo, b
       await ensureFont();
     }
 
+    const captionFilters = [];
     if(autoChunks && autoChunks.length){
       autoChunks.forEach(ch => {
         const safeText = ch.text.replace(/\\/g,'\\\\').replace(/'/g, "\\'").replace(/:/g, '\\:').replace(/,/g, '\\,');
-        vfFilters.push(`drawtext=${fontfileArg}text='${safeText}':fontcolor=${color}:fontsize=${size}:borderw=2:bordercolor=black:x=(w-text_w)/2:y=${yExpr}:enable='between(t\\,${ch.start.toFixed(2)}\\,${ch.end.toFixed(2)})'`);
+        captionFilters.push(`drawtext=${fontfileArg}text='${safeText}':fontcolor=${color}:fontsize=${size}:borderw=2:bordercolor=black:x=(w-text_w)/2:y=${yExpr}:enable='between(t\\,${ch.start.toFixed(2)}\\,${ch.end.toFixed(2)})'`);
       });
     } else if(clip.caption && clip.caption.trim()){
       const safeText = clip.caption.trim().replace(/\\/g,'\\\\').replace(/'/g, "\\'").replace(/:/g, '\\:');
-      vfFilters.push(`drawtext=${fontfileArg}text='${safeText}':fontcolor=${color}:fontsize=${size}:borderw=2:bordercolor=black:x=(w-text_w)/2:y=${yExpr}`);
+      captionFilters.push(`drawtext=${fontfileArg}text='${safeText}':fontcolor=${color}:fontsize=${size}:borderw=2:bordercolor=black:x=(w-text_w)/2:y=${yExpr}`);
     }
 
-    const vf = vfFilters.length ? ['-vf', vfFilters.join(',')] : [];
-    outName = (isPreview ? 'preview_' : 'clip_') + index + '.' + format;
-    statusEl.textContent = isPreview ? 'Merender pratinjau…' : `Merender klip ${index+1}…`;
+    // Deteksi wajah (kalau relevan) SEKALI saja, dipakai untuk keputusan crop tunggal ATAU kolase
+    let clusters = [];
+    if((aspect === '9:16' || aspect === '1:1') && (smartCropToggle.checked || collageToggle.checked)){
+      statusEl.textContent = 'Mendeteksi wajah…';
+      clusters = await detectFaceClusters(clip);
+    }
+    const useCollage = collageToggle.checked && clusters.length > 1;
 
-    await ffmpeg.run(
-      '-ss', String(clip.inPoint), '-to', String(clip.outPoint),
-      '-i', sourceName, ...vf,
-      ...(format === 'mp4' ? ['-c:v','libx264','-c:a','aac','-preset', preset, '-threads', String(threadCount)] : []),
-      outName
-    );
+    outName = (isPreview ? 'preview_' : 'clip_') + index + '.' + format;
+
+    if(useCollage && (aspect === '9:16' || aspect === '1:1')){
+      // ---- Jalur kolase: 2 tahap render (1) susun grid wajah, (2) tempel caption + format akhir
+      const iw = player.videoWidth || 1280, ih = player.videoHeight || 720;
+      const [outW, outH] = isPreview ? getTargetDims('480', aspect) : getTargetDims(resolutionSelect.value, aspect);
+      const collage = buildCollageFilterComplex(clusters, iw, ih, outW, outH);
+      statusEl.textContent = `Menyusun kolase ${clusters.length} orang…`;
+      logLine(`Mode kolase aktif: ${Math.min(clusters.length,4)} orang terdeteksi di klip ${index+1}.`);
+
+      await ffmpeg.run(
+        '-ss', String(clip.inPoint), '-to', String(clip.outPoint),
+        '-i', sourceName,
+        '-filter_complex', collage.filterComplex,
+        '-map', '[vcollage]', '-map', '0:a?',
+        '-c:v','libx264','-preset', preset, ...threadArgs, '-c:a','aac',
+        'collage_tmp.mp4'
+      );
+
+      const passTwoFilters = [];
+      if(format === 'gif') passTwoFilters.push('fps=12,scale=480:-1:flags=lanczos');
+      passTwoFilters.push(...captionFilters);
+      const vf2 = passTwoFilters.length ? ['-vf', passTwoFilters.join(',')] : [];
+
+      statusEl.textContent = isPreview ? 'Merender pratinjau…' : `Merender klip ${index+1}…`;
+      await ffmpeg.run(
+        '-i', 'collage_tmp.mp4', ...vf2,
+        ...(format === 'mp4' ? ['-c:v','libx264','-c:a','aac','-preset', preset, ...threadArgs] : []),
+        outName
+      );
+      try{ ffmpeg.FS('unlink', 'collage_tmp.mp4'); }catch(e){}
+
+    } else {
+      // ---- Jalur normal: crop satu-orang (atau tanpa crop) dalam satu kali render
+      if(aspect === '9:16' || aspect === '1:1'){
+        const iw = player.videoWidth || 1280, ih = player.videoHeight || 720;
+        let centerXFrac = null;
+        if(smartCropToggle.checked && clusters.length){
+          const totalWeight = clusters.reduce((a,c)=>a + c.occurrence*c.area, 0);
+          centerXFrac = clusters.reduce((a,c)=>a + c.cx*c.occurrence*c.area, 0) / totalWeight;
+        }
+        const cropF = buildCropFilter(aspect, iw, ih, centerXFrac);
+        const targetScale = isPreview ? getScaleTarget('480', aspect) : getScaleTarget(resolutionSelect.value, aspect);
+        vfFilters.push(cropF, targetScale);
+      } else if(isPreview){
+        vfFilters.push('scale=640:-2');
+      } else {
+        vfFilters.push(getScaleTarget(resolutionSelect.value, 'original'));
+      }
+      if(format === 'gif'){
+        vfFilters.push('fps=12,scale=480:-1:flags=lanczos');
+      }
+      vfFilters.push(...captionFilters);
+
+      const vf = vfFilters.length ? ['-vf', vfFilters.join(',')] : [];
+      statusEl.textContent = isPreview ? 'Merender pratinjau…' : `Merender klip ${index+1}…`;
+
+      await ffmpeg.run(
+        '-ss', String(clip.inPoint), '-to', String(clip.outPoint),
+        '-i', sourceName, ...vf,
+        ...(format === 'mp4' ? ['-c:v','libx264','-c:a','aac','-preset', preset, ...threadArgs] : []),
+        outName
+      );
+    }
 
     const data = ffmpeg.FS('readFile', outName);
     const mime = format === 'gif' ? 'image/gif' : (format === 'webm' ? 'video/webm' : 'video/mp4');
@@ -1002,7 +1158,7 @@ exportBtn.addEventListener('click', async () => {
     const speedPreset = speedSelect.value;
     // Flag encoding cepat: dipakai di setiap perintah yang meng-encode ulang video (libx264).
     // '-threads' memberi tahu x264 untuk memakai banyak core CPU sekaligus (butuh core-mt).
-    const speedFlags = ['-preset', speedPreset, '-threads', String(threadCount)];
+    const speedFlags = ['-preset', speedPreset, ...threadArgs];
     const caption = captionInput.value.trim();
     const mode = modeSelect.value;
     const outName = 'output.' + format;
@@ -1021,22 +1177,36 @@ exportBtn.addEventListener('click', async () => {
     }
 
     const vfFilters = [];
-
-    if(aspect === '9:16' || aspect === '1:1'){
-      const iw = player.videoWidth || 1280, ih = player.videoHeight || 720;
-      let centerXFrac = null;
-      if(smartCropToggle.checked){
-        const seg = clips.length ? clips[0] : { inPoint, outPoint };
-        logLine('Mendeteksi posisi wajah untuk crop pintar…');
-        centerXFrac = await detectFaceCenterX(seg);
-      }
-      vfFilters.push(
-        buildCropFilter(aspect, iw, ih, centerXFrac),
-        aspect === '9:16' ? 'scale=1080:1920' : 'scale=1080:1080'
-      );
+    let clusters = [];
+    const useCollageMain = collageToggle.checked && aspect !== 'original';
+    if((aspect === '9:16' || aspect === '1:1') && (smartCropToggle.checked || useCollageMain)){
+      const seg = clips.length ? clips[0] : { inPoint, outPoint };
+      logLine('Mendeteksi wajah untuk crop pintar…');
+      clusters = await detectFaceClusters(seg);
+    }
+    const doCollage = useCollageMain && clusters.length > 1 && mode === 'single';
+    if(useCollageMain && mode !== 'single' && clusters.length > 1){
+      logLine('Mode kolase saat ini hanya berlaku untuk mode "Potong satu klip" — pakai fitur Pratinjau per-klip di daftar potongan untuk kolase pada mode gabung.');
     }
 
-    if(format === 'gif'){
+    if(!doCollage){
+      if(aspect === '9:16' || aspect === '1:1'){
+        const iw = player.videoWidth || 1280, ih = player.videoHeight || 720;
+        let centerXFrac = null;
+        if(smartCropToggle.checked && clusters.length){
+          const totalWeight = clusters.reduce((a,c)=>a + c.occurrence*c.area, 0);
+          centerXFrac = clusters.reduce((a,c)=>a + c.cx*c.occurrence*c.area, 0) / totalWeight;
+        }
+        vfFilters.push(
+          buildCropFilter(aspect, iw, ih, centerXFrac),
+          getScaleTarget(resolutionSelect.value, aspect)
+        );
+      } else {
+        vfFilters.push(getScaleTarget(resolutionSelect.value, 'original'));
+      }
+    }
+
+    if(format === 'gif' && !doCollage){
       vfFilters.push('fps=12,scale=480:-1:flags=lanczos');
     }
 
@@ -1047,18 +1217,47 @@ exportBtn.addEventListener('click', async () => {
     if(captionPosition.value === 'center') yExpr = '(h-text_h)/2';
     const fontfileArg = fontReady ? "fontfile='/font.ttf':" : '';
 
+    const captionFiltersMain = [];
     if(useAutoCaption && autoChunks && autoChunks.length){
       autoChunks.forEach(c => {
         const safeText = c.text.replace(/\\/g,'\\\\').replace(/'/g, "\\'").replace(/:/g, '\\:').replace(/,/g, '\\,');
-        vfFilters.push(`drawtext=${fontfileArg}text='${safeText}':fontcolor=${color}:fontsize=${size}:borderw=2:bordercolor=black:x=(w-text_w)/2:y=${yExpr}:enable='between(t\\,${c.start.toFixed(2)}\\,${c.end.toFixed(2)})'`);
+        captionFiltersMain.push(`drawtext=${fontfileArg}text='${safeText}':fontcolor=${color}:fontsize=${size}:borderw=2:bordercolor=black:x=(w-text_w)/2:y=${yExpr}:enable='between(t\\,${c.start.toFixed(2)}\\,${c.end.toFixed(2)})'`);
       });
     } else if(caption){
       const safeText = caption.replace(/\\/g,'\\\\').replace(/'/g, "\\'").replace(/:/g, '\\:');
-      vfFilters.push(`drawtext=${fontfileArg}text='${safeText}':fontcolor=${color}:fontsize=${size}:borderw=2:bordercolor=black:x=(w-text_w)/2:y=${yExpr}`);
+      captionFiltersMain.push(`drawtext=${fontfileArg}text='${safeText}':fontcolor=${color}:fontsize=${size}:borderw=2:bordercolor=black:x=(w-text_w)/2:y=${yExpr}`);
     }
+    if(!doCollage) vfFilters.push(...captionFiltersMain);
     const vf = vfFilters.length ? ['-vf', vfFilters.join(',')] : [];
 
-    if(mode === 'single' || clips.length <= 1){
+    if(doCollage){
+      const seg = clips.length ? clips[0] : { inPoint, outPoint };
+      const iw = player.videoWidth || 1280, ih = player.videoHeight || 720;
+      const [outW, outH] = getTargetDims(resolutionSelect.value, aspect);
+      const collage = buildCollageFilterComplex(clusters, iw, ih, outW, outH);
+      logLine(`Mode kolase aktif: ${Math.min(clusters.length,4)} orang terdeteksi.`);
+
+      await ffmpeg.run(
+        '-ss', String(seg.inPoint), '-to', String(seg.outPoint),
+        '-i', sourceName,
+        '-filter_complex', collage.filterComplex,
+        '-map', '[vcollage]', '-map', '0:a?',
+        '-c:v','libx264', ...speedFlags, '-c:a','aac',
+        'collage_tmp.mp4'
+      );
+
+      const passTwoFilters = [];
+      if(format === 'gif') passTwoFilters.push('fps=12,scale=480:-1:flags=lanczos');
+      passTwoFilters.push(...captionFiltersMain);
+      const vf2 = passTwoFilters.length ? ['-vf', passTwoFilters.join(',')] : [];
+
+      await ffmpeg.run(
+        '-i', 'collage_tmp.mp4', ...vf2,
+        ...(format === 'mp4' ? ['-c:v','libx264','-c:a','aac', ...speedFlags] : []),
+        outName
+      );
+      try{ ffmpeg.FS('unlink', 'collage_tmp.mp4'); }catch(e){}
+    } else if(mode === 'single' || clips.length <= 1){
       const seg = clips.length ? clips[0] : { inPoint, outPoint };
       logLine(`Memotong ${fmt(seg.inPoint)} – ${fmt(seg.outPoint)}…`);
       await ffmpeg.run(
