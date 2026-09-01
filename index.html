@@ -394,7 +394,7 @@ let ready = false;
   }catch(e){
     if(supportsThreads){
       // core-mt gagal dimuat -> bikin instance ffmpeg baru dengan core single-thread sebagai cadangan
-      logLine('Mode multi-core gagal dimuat, mencoba mode single-core sebagai cadangan…');
+      logLine('Mode multi-core gagal dimuat: ' + (e && e.message ? e.message : e) + ' — mencoba mode single-core sebagai cadangan…');
       try{
         ffmpeg = createFFmpeg({ log: true, corePath: CORE_ST });
         await ffmpeg.load();
@@ -520,19 +520,25 @@ async function ensureFaceModel(){
   faceModelReady = true;
 }
 
-// Opsi deteksi yang lebih sensitif: inputSize lebih besar (menangkap wajah kecil/agak jauh
-// dari kamera) dan scoreThreshold diturunkan (menangkap wajah yang kurang menghadap kamera
-// langsung, pencahayaan kurang ideal, dsb). Trade-off: sedikit lebih lambat & mungkin ada
-// false-positive sesekali, tapi lebih jarang "kelewatan" orang yang sebenarnya ada di frame.
+// Opsi deteksi disesuaikan resolusi video sumber: inputSize yang jauh lebih besar dari
+// resolusi asli cuma buang-buang komputasi tanpa nambah detail nyata (mis. sumber 360p
+// tidak diuntungkan dipaksa dianalisis di 512px). scoreThreshold diturunkan supaya tetap
+// sensitif menangkap wajah yang kurang menghadap kamera/pencahayaan kurang ideal.
 function faceDetectOptions(){
-  return new faceapi.TinyFaceDetectorOptions({ inputSize: 512, scoreThreshold: 0.3 });
+  const h = player.videoHeight || 480;
+  let inputSize = 320;
+  if(h > 720) inputSize = 512;
+  else if(h > 480) inputSize = 416;
+  else if(h > 240) inputSize = 320;
+  else inputSize = 224;
+  return new faceapi.TinyFaceDetectorOptions({ inputSize, scoreThreshold: 0.3 });
 }
 
 // Mendeteksi SEMUA wajah di beberapa cuplikan frame sepanjang klip, lalu mengelompokkan
 // deteksi yang posisinya berdekatan sebagai "orang yang sama" — ini heuristik berbasis
 // posisi horizontal di frame, BUKAN pengenalan wajah/identitas asli. Jadi kalau seseorang
 // berpindah tempat drastis di tengah klip, bisa saja terhitung sebagai 2 klaster berbeda.
-// Hanya klaster yang muncul di ≥2 dari 5 frame sampel yang dianggap "orang yang stabil ada
+// Hanya klaster yang muncul di ≥2 dari 3 frame sampel yang dianggap "orang yang stabil ada
 // di frame" (menyaring deteksi sekali-doang yang mungkin salah/silau/dsb).
 async function detectFaceClusters(seg){
   try{
@@ -541,7 +547,7 @@ async function detectFaceClusters(seg){
     logLine('Model deteksi wajah gagal dimuat, pakai crop tengah biasa: ' + e.message);
     return [];
   }
-  const fracs = [0.1, 0.3, 0.5, 0.7, 0.9];
+  const fracs = [0.2, 0.5, 0.8];
   const options = faceDetectOptions();
   const raw = []; // {cx, area} dari semua wajah di semua frame sampel
   for(let i=0;i<fracs.length;i++){
@@ -611,7 +617,10 @@ function evenize(n){ return n % 2 === 0 ? n : n - 1; }
 // Menyusun filter_complex untuk kolase: video sumber di-duplikat sebanyak jumlah orang
 // terdeteksi (maks 4), tiap salinan di-crop berpusat pada posisi orang itu, lalu disusun
 // jadi grid (2 orang = tumpuk atas-bawah, 3 orang = 3 baris, 4 orang = grid 2x2).
-function buildCollageFilterComplex(clusters, iw, ih, outW, outH){
+// extraFilters (opsional, mis. drawtext caption / fps-scale gif) dirantai LANGSUNG setelah
+// xstack di filter_complex yang sama, supaya cukup satu kali render (dulu 2 kali: susun
+// grid dulu baru caption terpisah — boros satu putaran encode penuh tanpa perlu).
+function buildCollageFilterComplex(clusters, iw, ih, outW, outH, extraFilters){
   const n = Math.min(clusters.length, 4);
   const used = clusters.slice(0, n);
   const cols = n === 4 ? 2 : 1;
@@ -631,7 +640,11 @@ function buildCollageFilterComplex(clusters, iw, ih, outW, outH){
     const row = Math.floor(i/cols), col = i%cols;
     return `${col*panelW}_${row*panelH}`;
   });
-  filter += labels.map(l=>`[${l}]`).join('') + `xstack=inputs=${n}:layout=${layoutParts.join('|')}[vcollage]`;
+  const outLabel = (extraFilters && extraFilters.length) ? 'vpre' : 'vout';
+  filter += labels.map(l=>`[${l}]`).join('') + `xstack=inputs=${n}:layout=${layoutParts.join('|')}[${outLabel}]`;
+  if(extraFilters && extraFilters.length){
+    filter += `;[vpre]${extraFilters.join(',')}[vout]`;
+  }
   return { filterComplex: filter, width: cols*panelW, height: rows*panelH };
 }
 
@@ -912,10 +925,13 @@ async function runClipAction(clip, index, { isPreview, statusEl, previewVideo, b
     outName = (isPreview ? 'preview_' : 'clip_') + index + '.' + format;
 
     if(useCollage && (aspect === '9:16' || aspect === '1:1')){
-      // ---- Jalur kolase: 2 tahap render (1) susun grid wajah, (2) tempel caption + format akhir
+      // ---- Jalur kolase: SATU kali render (grid + caption dirantai di filter_complex yang sama)
       const iw = player.videoWidth || 1280, ih = player.videoHeight || 720;
       const [outW, outH] = isPreview ? getTargetDims('480', aspect) : getTargetDims(resolutionSelect.value, aspect);
-      const collage = buildCollageFilterComplex(clusters, iw, ih, outW, outH);
+      const extraFilters = [];
+      if(format === 'gif') extraFilters.push('fps=12,scale=480:-1:flags=lanczos');
+      extraFilters.push(...captionFilters);
+      const collage = buildCollageFilterComplex(clusters, iw, ih, outW, outH, extraFilters);
       statusEl.textContent = `Menyusun kolase ${clusters.length} orang…`;
       logLine(`Mode kolase aktif: ${Math.min(clusters.length,4)} orang terdeteksi di klip ${index+1}.`);
 
@@ -923,23 +939,10 @@ async function runClipAction(clip, index, { isPreview, statusEl, previewVideo, b
         '-ss', String(clip.inPoint), '-to', String(clip.outPoint),
         '-i', sourceName,
         '-filter_complex', collage.filterComplex,
-        '-map', '[vcollage]', '-map', '0:a?',
-        '-c:v','libx264','-preset', preset, ...threadArgs, '-c:a','aac',
-        'collage_tmp.mp4'
-      );
-
-      const passTwoFilters = [];
-      if(format === 'gif') passTwoFilters.push('fps=12,scale=480:-1:flags=lanczos');
-      passTwoFilters.push(...captionFilters);
-      const vf2 = passTwoFilters.length ? ['-vf', passTwoFilters.join(',')] : [];
-
-      statusEl.textContent = isPreview ? 'Merender pratinjau…' : `Merender klip ${index+1}…`;
-      await ffmpeg.run(
-        '-i', 'collage_tmp.mp4', ...vf2,
-        ...(format === 'mp4' ? ['-c:v','libx264','-c:a','aac','-preset', preset, ...threadArgs] : []),
+        '-map', '[vout]', '-map', '0:a?',
+        ...(format === 'mp4' ? ['-c:v','libx264','-preset', preset, ...threadArgs, '-c:a','aac'] : ['-c:v','libx264','-preset', preset, ...threadArgs]),
         outName
       );
-      try{ ffmpeg.FS('unlink', 'collage_tmp.mp4'); }catch(e){}
 
     } else {
       // ---- Jalur normal: crop satu-orang (atau tanpa crop) dalam satu kali render
@@ -1234,29 +1237,20 @@ exportBtn.addEventListener('click', async () => {
       const seg = clips.length ? clips[0] : { inPoint, outPoint };
       const iw = player.videoWidth || 1280, ih = player.videoHeight || 720;
       const [outW, outH] = getTargetDims(resolutionSelect.value, aspect);
-      const collage = buildCollageFilterComplex(clusters, iw, ih, outW, outH);
+      const extraFilters = [];
+      if(format === 'gif') extraFilters.push('fps=12,scale=480:-1:flags=lanczos');
+      extraFilters.push(...captionFiltersMain);
+      const collage = buildCollageFilterComplex(clusters, iw, ih, outW, outH, extraFilters);
       logLine(`Mode kolase aktif: ${Math.min(clusters.length,4)} orang terdeteksi.`);
 
       await ffmpeg.run(
         '-ss', String(seg.inPoint), '-to', String(seg.outPoint),
         '-i', sourceName,
         '-filter_complex', collage.filterComplex,
-        '-map', '[vcollage]', '-map', '0:a?',
+        '-map', '[vout]', '-map', '0:a?',
         '-c:v','libx264', ...speedFlags, '-c:a','aac',
-        'collage_tmp.mp4'
-      );
-
-      const passTwoFilters = [];
-      if(format === 'gif') passTwoFilters.push('fps=12,scale=480:-1:flags=lanczos');
-      passTwoFilters.push(...captionFiltersMain);
-      const vf2 = passTwoFilters.length ? ['-vf', passTwoFilters.join(',')] : [];
-
-      await ffmpeg.run(
-        '-i', 'collage_tmp.mp4', ...vf2,
-        ...(format === 'mp4' ? ['-c:v','libx264','-c:a','aac', ...speedFlags] : []),
         outName
       );
-      try{ ffmpeg.FS('unlink', 'collage_tmp.mp4'); }catch(e){}
     } else if(mode === 'single' || clips.length <= 1){
       const seg = clips.length ? clips[0] : { inPoint, outPoint };
       logLine(`Memotong ${fmt(seg.inPoint)} – ${fmt(seg.outPoint)}…`);
