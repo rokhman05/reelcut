@@ -368,7 +368,12 @@ const { createFFmpeg, fetchFile } = FFmpeg;
 // yang sudah disediakan coi-serviceworker.js). Kalau browser/perangkat tidak mendukung
 // SharedArrayBuffer, otomatis jatuh ke core single-thread lama sebagai cadangan.
 const supportsThreads = typeof SharedArrayBuffer !== 'undefined' && window.crossOriginIsolated;
-const CORE_MT = 'https://unpkg.com/@ffmpeg/core-mt@0.11.0/dist/ffmpeg-core.js';
+// PENTING: core-mt (multi-thread) HARUS diambil dari CDN yang mengirim header
+// "Cross-Origin-Resource-Policy: cross-origin" (jsDelivr) — unpkg TIDAK mengirim header
+// ini, jadi begitu halaman aktif dalam mode cross-origin-isolated (via coi-serviceworker),
+// browser memblokir file core-mt dari unpkg dengan error "Failed to fetch". Ini akar
+// masalah nyata yang bikin mode multi-core selalu gagal & jatuh ke single-core.
+const CORE_MT = 'https://cdn.jsdelivr.net/npm/@ffmpeg/core-mt@0.11.0/dist/ffmpeg-core.js';
 const CORE_ST = 'https://unpkg.com/@ffmpeg/core@0.11.0/dist/ffmpeg-core.js';
 const threadCount = Math.min(navigator.hardwareConcurrency || 4, 8);
 let ffmpeg = createFFmpeg({
