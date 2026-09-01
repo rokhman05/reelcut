@@ -239,9 +239,23 @@
         <div style="display:flex; align-items:center; justify-content:space-between; gap:10px;">
           <div>
             <strong style="font-size:13px;">Cari momen menarik otomatis</strong>
-            <div style="color:var(--muted); font-size:11.5px; margin-top:2px;">Berdasar lonjakan energi audio (tawa, penekanan suara) — bukan analisis AI semantik, jadi anggap ini titik awal, bukan hasil final.</div>
+            <div style="color:var(--muted); font-size:11.5px; margin-top:2px;">Mendeteksi lonjakan mendadak dibanding suasana audio di sekitarnya (bukan sekadar "keras") — lebih peka ke tawa/reaksi/penekanan suara, bukan cuma musik/suara latar yang konsisten keras. Tetap heuristik audio, bukan AI semantik — anggap titik awal.</div>
           </div>
           <button class="ghost" id="findHighlights" style="white-space:nowrap;">Cari momen</button>
+        </div>
+        <div style="display:flex; gap:10px;">
+          <div style="flex:1;">
+            <label class="small" for="highlightSensitivity">Sensitivitas</label>
+            <select id="highlightSensitivity">
+              <option value="longgar">Longgar (lebih banyak usulan)</option>
+              <option value="sedang" selected>Sedang</option>
+              <option value="ketat">Ketat (lebih selektif)</option>
+            </select>
+          </div>
+          <div style="flex:1;">
+            <label class="small" for="highlightClipLen">Panjang klip usulan (detik)</label>
+            <input type="number" id="highlightClipLen" class="field" value="24" min="5" max="90" step="1">
+          </div>
         </div>
         <div class="queue" id="highlightResults"></div>
       </div>
@@ -530,6 +544,8 @@ const collageField = document.getElementById('collageField');
 const collageToggle = document.getElementById('collageToggle');
 const autoCaptionToggle = document.getElementById('autoCaptionToggle');
 const findHighlightsBtn = document.getElementById('findHighlights');
+const highlightSensitivity = document.getElementById('highlightSensitivity');
+const highlightClipLen = document.getElementById('highlightClipLen');
 const highlightResults = document.getElementById('highlightResults');
 const transcriptStatus = document.getElementById('transcriptStatus');
 
@@ -583,15 +599,18 @@ function faceDetectOptions(){
   else if(h > 480) inputSize = 416;
   else if(h > 240) inputSize = 320;
   else inputSize = 224;
-  return new faceapi.TinyFaceDetectorOptions({ inputSize, scoreThreshold: 0.3 });
+  // scoreThreshold dinaikkan dari 0.3 -> 0.5: nilai 0.3 terlalu longgar dan sering
+  // salah tangkap pola non-wajah (motif kain, bayangan, dsb) sebagai wajah.
+  return new faceapi.TinyFaceDetectorOptions({ inputSize, scoreThreshold: 0.5 });
 }
 
 // Mendeteksi SEMUA wajah di beberapa cuplikan frame sepanjang klip, lalu mengelompokkan
 // deteksi yang posisinya berdekatan sebagai "orang yang sama" — ini heuristik berbasis
-// posisi horizontal di frame, BUKAN pengenalan wajah/identitas asli. Jadi kalau seseorang
-// berpindah tempat drastis di tengah klip, bisa saja terhitung sebagai 2 klaster berbeda.
-// Hanya klaster yang muncul di ≥2 dari 3 frame sampel yang dianggap "orang yang stabil ada
-// di frame" (menyaring deteksi sekali-doang yang mungkin salah/silau/dsb).
+// posisi di frame (horizontal & vertikal), BUKAN pengenalan wajah/identitas asli. Jadi
+// kalau seseorang berpindah tempat drastis di tengah klip, bisa saja terhitung sebagai
+// klaster berbeda. Sampel dinaikkan dari 3 -> 5 frame supaya lebih tahan terhadap wajah
+// yang sempat menoleh/tertutup sesaat, dan deteksi kotak sangat kecil (kemungkinan besar
+// salah tangkap) disaring karena TinyFaceDetector cenderung false-positive di objek kecil.
 async function detectFaceClusters(seg){
   try{
     await ensureFaceModel();
@@ -599,9 +618,9 @@ async function detectFaceClusters(seg){
     logLine('Model deteksi wajah gagal dimuat, pakai crop tengah biasa: ' + e.message);
     return [];
   }
-  const fracs = [0.2, 0.5, 0.8];
+  const fracs = [0.1, 0.3, 0.5, 0.7, 0.9];
   const options = faceDetectOptions();
-  const raw = []; // {cx, area} dari semua wajah di semua frame sampel
+  const raw = []; // {cx, cy, area} dari semua wajah di semua frame sampel
   for(let i=0;i<fracs.length;i++){
     const t = seg.inPoint + (seg.outPoint - seg.inPoint) * fracs[i];
     const frameName = `face_frame_${i}.jpg`;
@@ -614,33 +633,53 @@ async function detectFaceClusters(seg){
       const canvas = document.createElement('canvas');
       canvas.width = bitmap.width; canvas.height = bitmap.height;
       canvas.getContext('2d').drawImage(bitmap, 0, 0);
+      const frameArea = bitmap.width * bitmap.height;
       const dets = await faceapi.detectAllFaces(canvas, options);
-      dets.forEach(det => raw.push({
-        cx: (det.box.x + det.box.width/2) / bitmap.width,
-        area: det.box.width * det.box.height
-      }));
+      dets.forEach(det => {
+        const area = det.box.width * det.box.height;
+        // Buang deteksi dengan kotak sangat kecil (<0.15% luas frame) — di ukuran ini
+        // TinyFaceDetector jauh lebih sering salah tangkap ketimbang benar-benar wajah.
+        if(area / frameArea < 0.0015) return;
+        raw.push({
+          cx: (det.box.x + det.box.width/2) / bitmap.width,
+          cy: (det.box.y + det.box.height/2) / bitmap.height,
+          area
+        });
+      });
     }catch(err){ /* lewati frame ini kalau gagal diekstrak/dideteksi */ }
   }
   if(raw.length === 0) return [];
 
-  raw.sort((a,b)=>a.cx-b.cx);
+  // Clustering 2D (posisi x DAN y) pakai jarak Euclidean sederhana, bukan cuma sumbu x —
+  // dua wajah yang kebetulan sejajar secara horizontal tapi beda tinggi (mis. orang duduk
+  // vs berdiri) sebelumnya bisa salah tergabung jadi satu klaster.
   const clusters = [];
   raw.forEach(f => {
-    const last = clusters[clusters.length-1];
-    if(last && (f.cx - last.avgCx) < 0.14){
-      last.items.push(f);
-      last.avgCx = last.items.reduce((a,x)=>a+x.cx,0)/last.items.length;
+    let best = null, bestDist = Infinity;
+    for(const c of clusters){
+      const d = Math.hypot(f.cx - c.avgCx, f.cy - c.avgCy);
+      if(d < 0.16 && d < bestDist){ best = c; bestDist = d; }
+    }
+    if(best){
+      best.items.push(f);
+      best.avgCx = best.items.reduce((a,x)=>a+x.cx,0)/best.items.length;
+      best.avgCy = best.items.reduce((a,x)=>a+x.cy,0)/best.items.length;
     } else {
-      clusters.push({ avgCx: f.cx, items:[f] });
+      clusters.push({ avgCx: f.cx, avgCy: f.cy, items:[f] });
     }
   });
 
-  const stable = clusters.filter(c => c.items.length >= 2);
+  // Hanya klaster yang muncul di ≥40% frame sampel dianggap "orang yang stabil ada di
+  // frame" (menyaring deteksi sekali-doang yang mungkin salah/silau/dsb). Dengan 5 sampel,
+  // ini berarti minimal muncul di 2 dari 5 frame.
+  const minOccurrence = Math.max(2, Math.ceil(fracs.length * 0.4));
+  const stable = clusters.filter(c => c.items.length >= minOccurrence);
   const chosen = stable.length ? stable : clusters; // kalau tidak ada yang stabil, tetap pakai apa adanya daripada kosong
 
   return chosen
     .map(c => ({
       cx: c.avgCx,
+      cy: c.avgCy,
       occurrence: c.items.length,
       area: c.items.reduce((a,x)=>a+x.area,0)/c.items.length
     }))
@@ -667,20 +706,25 @@ async function detectFaceCenterX(seg){
 function evenize(n){ return n % 2 === 0 ? n : n - 1; }
 
 // Menyusun filter_complex untuk kolase: video sumber di-duplikat sebanyak jumlah orang
-// terdeteksi (maks 4), tiap salinan di-crop berpusat pada posisi orang itu, lalu disusun
-// jadi grid (2 orang = tumpuk atas-bawah, 3 orang = 3 baris, 4 orang = grid 2x2).
+// terdeteksi (maks 4), tiap salinan di-crop berpusat pada posisi orang itu, lalu ditempel
+// di atas kanvas warna solid dengan JARAK ANTAR PANEL (gap) — bukan ditempel mentah tanpa
+// batas seperti sebelumnya, yang bikin hasilnya terasa kasar/dipotong-paksa. Kanvas +
+// gap ini yang bikin hasilnya terlihat seperti layout kolase yang disengaja.
 // extraFilters (opsional, mis. drawtext caption / fps-scale gif) dirantai LANGSUNG setelah
-// xstack di filter_complex yang sama, supaya cukup satu kali render (dulu 2 kali: susun
-// grid dulu baru caption terpisah — boros satu putaran encode penuh tanpa perlu).
+// susunan grid di filter_complex yang sama, supaya cukup satu kali render.
 function buildCollageFilterComplex(clusters, iw, ih, outW, outH, extraFilters){
   const n = Math.min(clusters.length, 4);
   const used = clusters.slice(0, n);
   const cols = n === 4 ? 2 : 1;
   const rows = n === 4 ? 2 : n;
-  const panelW = evenize(Math.floor(outW / cols));
-  const panelH = evenize(Math.floor(outH / rows));
+  // Jarak antar panel + pinggir kanvas, proporsional ke ukuran keluaran (min 4px)
+  // supaya tetap wajar baik untuk preview kecil maupun ekspor resolusi penuh.
+  const gap = Math.max(4, Math.round(Math.min(outW, outH) * 0.012));
+  const panelW = evenize(Math.max(2, Math.floor((outW - gap*(cols+1)) / cols)));
+  const panelH = evenize(Math.max(2, Math.floor((outH - gap*(rows+1)) / rows)));
 
-  let filter = `[0:v]split=${n}` + used.map((_,i)=>`[cs${i}]`).join('') + ';';
+  let filter = `color=c=black:s=${outW}x${outH}[bg];`;
+  filter += `[0:v]split=${n}` + used.map((_,i)=>`[cs${i}]`).join('') + ';';
   const labels = [];
   used.forEach((c, i) => {
     const cw = evenize(Math.max(2, Math.min(iw, Math.round(ih * panelW / panelH))));
@@ -688,16 +732,25 @@ function buildCollageFilterComplex(clusters, iw, ih, outW, outH, extraFilters){
     filter += `[cs${i}]crop=${cw}:${ih}:${cx}:0,scale=${panelW}:${panelH}[cp${i}];`;
     labels.push(`cp${i}`);
   });
-  const layoutParts = labels.map((_,i)=>{
+
+  // Tempel tiap panel ke kanvas satu per satu (overlay berantai) di posisi yang sudah
+  // memperhitungkan gap, alih-alih xstack mentah yang menempel tanpa jarak sama sekali.
+  let cur = 'bg';
+  const hasExtra = extraFilters && extraFilters.length;
+  labels.forEach((l, i) => {
     const row = Math.floor(i/cols), col = i%cols;
-    return `${col*panelW}_${row*panelH}`;
+    const x = gap + col*(panelW+gap);
+    const y = gap + row*(panelH+gap);
+    const isLast = i === labels.length-1;
+    const next = isLast ? (hasExtra ? 'vpre' : 'vout') : `ov${i}`;
+    filter += `[${cur}][${l}]overlay=${x}:${y}[${next}];`;
+    cur = next;
   });
-  const outLabel = (extraFilters && extraFilters.length) ? 'vpre' : 'vout';
-  filter += labels.map(l=>`[${l}]`).join('') + `xstack=inputs=${n}:layout=${layoutParts.join('|')}[${outLabel}]`;
-  if(extraFilters && extraFilters.length){
+  filter = filter.replace(/;$/, '');
+  if(hasExtra){
     filter += `;[vpre]${extraFilters.join(',')}[vout]`;
   }
-  return { filterComplex: filter, width: cols*panelW, height: rows*panelH };
+  return { filterComplex: filter, width: outW, height: outH };
 }
 
 // Menyusun filter crop, dengan titik tengah horizontal mengikuti posisi wajah kalau ada (centerXFrac 0..1),
@@ -1111,24 +1164,54 @@ findHighlightsBtn.addEventListener('click', async () => {
     try{ ffmpeg.FS('unlink','highlight_audio.wav'); }catch(e){}
     const samples = await decodeWavTo16k(wavData);
     const sr = 16000;
-    const windowSize = sr; // 1 detik
+
+    // ---- Deteksi momen "advance": lonjakan MENDADAK dibanding suasana sekitarnya,
+    // bukan sekadar volume tinggi. Ini beda penting: video dengan musik latar yang
+    // konsisten keras dulunya selalu "menang" karena rata-rata volumenya tinggi;
+    // sekarang tiap titik dibandingkan ke baseline LOKAL di sekitarnya (bukan rata-rata
+    // satu video penuh), jadi reaksi/tawa mendadak di bagian tenang ikut terdeteksi,
+    // dan bagian yang memang konsisten keras dari awal (musik) tidak otomatis menang.
+    const hop = 0.5; // detik — resolusi lebih halus dari versi sebelumnya (1 detik)
+    const winSec = 1.0; // panjang jendela RMS per titik
+    const hopSize = Math.round(sr*hop);
+    const winSize = Math.round(sr*winSec);
     const energies = [];
-    for(let i=0; i<samples.length; i += windowSize){
+    for(let i=0; i<samples.length; i += hopSize){
+      const end = Math.min(i+winSize, samples.length);
       let sum = 0;
-      const end = Math.min(i+windowSize, samples.length);
       for(let j=i;j<end;j++) sum += samples[j]*samples[j];
       energies.push(Math.sqrt(sum/(end-i)));
     }
-    const mean = energies.reduce((a,b)=>a+b,0)/energies.length;
-    const variance = energies.reduce((a,b)=>a+(b-mean)*(b-mean),0)/energies.length;
-    const std = Math.sqrt(variance);
-    const threshold = mean + std * 1.1;
 
-    const clipLen = 24; // detik per klip usulan
-    const candidates = [];
+    // Baseline lokal via median bergulir (±15 detik) — tahan terhadap satu lonjakan besar
+    // yang bisa menggeser rata-rata (beda dengan mean biasa yang gampang "ketarik" outlier).
+    const baselineHalfPoints = Math.round(15/hop);
+    const baseline = new Array(energies.length);
     for(let i=0;i<energies.length;i++){
-      if(energies[i] > threshold){
-        candidates.push({ t: i, score: energies[i] });
+      const lo = Math.max(0, i-baselineHalfPoints), hi = Math.min(energies.length-1, i+baselineHalfPoints);
+      const slice = energies.slice(lo, hi+1).slice().sort((a,b)=>a-b);
+      baseline[i] = slice[Math.floor(slice.length/2)];
+    }
+
+    // Skor onset: seberapa besar lonjakan MENDADAK dari titik sebelumnya (bukan cuma
+    // "di atas baseline" tapi "tiba-tiba naik") — ini yang membedakan reaksi/tawa
+    // (naik cepat) dari musik/suara latar yang keras tapi rata (naik pelan/konstan).
+    const onset = energies.map((e,i) => i===0 ? 0 : Math.max(0, e - energies[i-1]));
+    const scores = energies.map((e,i) => Math.max(0, e - baseline[i]) + onset[i]*1.5);
+
+    const validScores = scores.filter(s => s > 0);
+    const sMean = validScores.length ? validScores.reduce((a,b)=>a+b,0)/validScores.length : 0;
+    const sVar = validScores.length ? validScores.reduce((a,b)=>a+(b-sMean)*(b-sMean),0)/validScores.length : 0;
+    const sStd = Math.sqrt(sVar);
+
+    const sensitivityMult = { longgar: 0.75, sedang: 1.15, ketat: 1.6 }[highlightSensitivity.value] || 1.15;
+    const scoreThreshold = sMean + sStd * sensitivityMult;
+
+    const clipLen = Math.min(90, Math.max(5, parseFloat(highlightClipLen.value) || 24));
+    const candidates = [];
+    for(let i=0;i<scores.length;i++){
+      if(scores[i] > scoreThreshold){
+        candidates.push({ t: i*hop, score: scores[i] });
       }
     }
     candidates.sort((a,b)=>b.score-a.score);
