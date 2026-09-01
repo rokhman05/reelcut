@@ -196,7 +196,13 @@
   <div>
     <h1>Reel<span>cut</span></h1>
   </div>
-  <p id="engineStatus"><span class="status-dot"></span>Menyiapkan mesin video…</p>
+  <div style="display:flex; align-items:center; gap:14px;">
+    <label style="display:flex; align-items:center; gap:6px; font-size:11.5px; color:var(--muted); cursor:pointer;" title="Eksperimental: bisa lebih cepat, tapi diketahui macet total tanpa error di sebagian besar browser Chromium (Chrome/Edge). Coba hanya kalau kamu memakai Firefox atau ingin mencoba.">
+      <input type="checkbox" id="multiThreadToggle">
+      Coba mode multi-core (eksperimental)
+    </label>
+    <p id="engineStatus"><span class="status-dot"></span>Menyiapkan mesin video…</p>
+  </div>
 </header>
 
 <main>
@@ -364,22 +370,32 @@ import { pipeline, env } from 'https://cdn.jsdelivr.net/npm/@xenova/transformers
 env.allowLocalModels = false;
 
 const { createFFmpeg, fetchFile } = FFmpeg;
-// Core multi-thread: memakai banyak core CPU sekaligus (butuh cross-origin isolation,
-// yang sudah disediakan coi-serviceworker.js). Kalau browser/perangkat tidak mendukung
-// SharedArrayBuffer, otomatis jatuh ke core single-thread lama sebagai cadangan.
+// PENTING: mode multi-thread ffmpeg.wasm (core-mt) punya bug lama yang belum diperbaiki upstream —
+// di banyak browser berbasis Chromium (Chrome, Edge, dll) proses load/exec-nya bisa macet total
+// TANPA error apapun, jadi terlihat seperti "tidak kunjung selesai disiapkan" selamanya.
+// Referensi bug resmi: github.com/ffmpegwasm/ffmpeg.wasm/issues/597, /772, /754
+// Karena itu, mode single-thread dipakai sebagai default (stabil di semua browser).
+// Multi-core cuma dicoba kalau pengguna aktifkan manual lewat toggle di bawah, dan tetap
+// dilindungi timeout supaya tidak macet selamanya.
 const supportsThreads = typeof SharedArrayBuffer !== 'undefined' && window.crossOriginIsolated;
-// PENTING: core-mt (multi-thread) HARUS diambil dari CDN yang mengirim header
-// "Cross-Origin-Resource-Policy: cross-origin" (jsDelivr) — unpkg TIDAK mengirim header
-// ini, jadi begitu halaman aktif dalam mode cross-origin-isolated (via coi-serviceworker),
-// browser memblokir file core-mt dari unpkg dengan error "Failed to fetch". Ini akar
-// masalah nyata yang bikin mode multi-core selalu gagal & jatuh ke single-core.
 const CORE_MT = 'https://cdn.jsdelivr.net/npm/@ffmpeg/core-mt@0.11.0/dist/ffmpeg-core.js';
 const CORE_ST = 'https://unpkg.com/@ffmpeg/core@0.11.0/dist/ffmpeg-core.js';
 const threadCount = Math.min(navigator.hardwareConcurrency || 4, 8);
-let ffmpeg = createFFmpeg({
-  log: true,
-  corePath: supportsThreads ? CORE_MT : CORE_ST,
-});
+let usingThreads = false;
+let ffmpeg = createFFmpeg({ log: true, corePath: CORE_ST });
+
+// Membatasi sebuah promise dengan batas waktu — kalau tidak selesai dalam `ms`,
+// promise ditolak (reject) supaya kode di atasnya bisa jatuh ke jalur cadangan
+// alih-alih menggantung selamanya (ini akar masalah yang dikeluhkan).
+function withTimeout(promise, ms, label){
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`${label} melebihi batas waktu (${(ms/1000)|0} detik)`)), ms);
+    promise.then(
+      (v) => { clearTimeout(timer); resolve(v); },
+      (e) => { clearTimeout(timer); reject(e); }
+    );
+  });
+}
 
 const engineStatus = document.getElementById('engineStatus');
 const logEl = document.getElementById('log');
@@ -389,34 +405,63 @@ function logLine(msg){
 }
 
 let ready = false;
-(async () => {
+async function loadEngine(){
+  ready = false;
+  engineStatus.innerHTML = '<span class="status-dot"></span>Memuat mesin video…';
   try{
-    logLine(supportsThreads ? `Memuat mesin video (mode multi-core, ${threadCount} thread)…` : 'Memuat mesin video (mode single-core)…');
-    await ffmpeg.load();
+    logLine('Memuat mesin video (mode single-core, stabil di semua browser)…');
+    await withTimeout(ffmpeg.load(), 30000, 'Memuat mesin video');
     ready = true;
+    usingThreads = false;
     engineStatus.innerHTML = '<span class="status-dot ready"></span>Mesin video siap';
-    logLine('Mesin video (ffmpeg) siap digunakan.' + (supportsThreads ? ' Pemrosesan akan memakai banyak core CPU sekaligus, jadi lebih cepat.' : ''));
+    logLine('Mesin video (ffmpeg) siap digunakan.');
   }catch(e){
-    if(supportsThreads){
-      // core-mt gagal dimuat -> bikin instance ffmpeg baru dengan core single-thread sebagai cadangan
-      logLine('Mode multi-core gagal dimuat: ' + (e && e.message ? e.message : e) + ' — mencoba mode single-core sebagai cadangan…');
-      try{
-        ffmpeg = createFFmpeg({ log: true, corePath: CORE_ST });
-        await ffmpeg.load();
-        ready = true;
-        engineStatus.innerHTML = '<span class="status-dot ready"></span>Mesin video siap (mode cadangan)';
-        logLine('Mesin video siap (single-core).');
-        return;
-      }catch(e2){
-        engineStatus.innerHTML = '<span class="status-dot" style="background:var(--danger)"></span>Gagal memuat mesin video';
-        logLine('Gagal memuat ffmpeg.wasm: ' + e2.message + '. Coba muat ulang halaman atau cek koneksi internet.');
-        return;
-      }
-    }
     engineStatus.innerHTML = '<span class="status-dot" style="background:var(--danger)"></span>Gagal memuat mesin video';
-    logLine('Gagal memuat ffmpeg.wasm: ' + e.message + '. Coba muat ulang halaman atau cek koneksi internet (dibutuhkan sekali saat pertama buka).');
+    logLine('Gagal memuat ffmpeg.wasm: ' + (e && e.message ? e.message : e) + '. Coba muat ulang halaman atau cek koneksi internet (dibutuhkan sekali saat pertama buka).');
   }
-})();
+}
+
+// Mode multi-core bersifat opsional (bukan default) karena ffmpeg.wasm versi multi-thread
+// punya bug lama yang belum diperbaiki: bisa macet total tanpa error di Chrome/Edge/Safari
+// (lihat referensi bug di komentar atas). Dilindungi timeout supaya kalau tetap macet,
+// otomatis kembali ke single-core, bukan menggantung selamanya.
+async function tryEnableMultiThread(){
+  if(!supportsThreads){
+    logLine('Mode multi-core tidak didukung di browser/perangkat ini (butuh SharedArrayBuffer), tetap pakai single-core.');
+    return;
+  }
+  engineStatus.innerHTML = '<span class="status-dot"></span>Mencoba mode multi-core (eksperimental)…';
+  logLine(`Mencoba mode multi-core (${threadCount} thread)… kalau macet, otomatis kembali ke single-core dalam 20 detik.`);
+  const mtFfmpeg = createFFmpeg({ log: true, corePath: CORE_MT });
+  try{
+    await withTimeout(mtFfmpeg.load(), 20000, 'Mode multi-core');
+    ffmpeg = mtFfmpeg;
+    usingThreads = true;
+    ready = true;
+    engineStatus.innerHTML = '<span class="status-dot ready"></span>Mesin video siap (multi-core)';
+    logLine('Mode multi-core berhasil dimuat.');
+  }catch(e){
+    logLine('Mode multi-core gagal/macet: ' + (e && e.message ? e.message : e) + ' — tetap pakai single-core (stabil).');
+    engineStatus.innerHTML = ready ? '<span class="status-dot ready"></span>Mesin video siap' : '<span class="status-dot"></span>Memuat mesin video…';
+    if(!ready) await loadEngine();
+  }
+}
+
+loadEngine();
+
+const multiThreadToggle = document.getElementById('multiThreadToggle');
+multiThreadToggle.addEventListener('change', async () => {
+  if(multiThreadToggle.checked){
+    if(busy){ logLine('Tunggu proses saat ini selesai dulu sebelum ganti mode mesin video.'); multiThreadToggle.checked = false; return; }
+    await tryEnableMultiThread();
+    multiThreadToggle.checked = usingThreads;
+  } else {
+    if(busy){ logLine('Tunggu proses saat ini selesai dulu sebelum ganti mode mesin video.'); multiThreadToggle.checked = true; return; }
+    logLine('Kembali ke mode single-core (stabil)…');
+    ffmpeg = createFFmpeg({ log: true, corePath: CORE_ST });
+    await loadEngine();
+  }
+});
 
 // ---- Elements
 const dropzone = document.getElementById('dropzone');
@@ -443,7 +488,9 @@ const speedSelect = document.getElementById('speedSelect');
 const resolutionSelect = document.getElementById('resolutionSelect');
 
 // Pakai semua core CPU yang tersedia secara eksplisit (sisakan 1 core biar UI tidak macet).
-const threadArgs = supportsThreads ? ['-threads', String(threadCount)] : [];
+// Dihitung saat dipakai (bukan sekali di awal), karena mode multi-core baru aktif
+// setelah pengguna mengaktifkannya secara manual lewat toggle eksperimental.
+function threadArgs(){ return usingThreads ? ['-threads', String(threadCount)] : []; }
 
 // Target lebar/tinggi keluaran berdasar pilihan resolusi — ini pengaruhnya jauh lebih besar
 // ke kecepatan proses dibanding preset x264 saja, terutama kalau video sumber 1080p/4K.
@@ -945,7 +992,7 @@ async function runClipAction(clip, index, { isPreview, statusEl, previewVideo, b
         '-i', sourceName,
         '-filter_complex', collage.filterComplex,
         '-map', '[vout]', '-map', '0:a?',
-        ...(format === 'mp4' ? ['-c:v','libx264','-preset', preset, ...threadArgs, '-c:a','aac'] : ['-c:v','libx264','-preset', preset, ...threadArgs]),
+        ...(format === 'mp4' ? ['-c:v','libx264','-preset', preset, ...threadArgs(), '-c:a','aac'] : ['-c:v','libx264','-preset', preset, ...threadArgs()]),
         outName
       );
 
@@ -977,7 +1024,7 @@ async function runClipAction(clip, index, { isPreview, statusEl, previewVideo, b
       await ffmpeg.run(
         '-ss', String(clip.inPoint), '-to', String(clip.outPoint),
         '-i', sourceName, ...vf,
-        ...(format === 'mp4' ? ['-c:v','libx264','-c:a','aac','-preset', preset, ...threadArgs] : []),
+        ...(format === 'mp4' ? ['-c:v','libx264','-c:a','aac','-preset', preset, ...threadArgs()] : []),
         outName
       );
     }
@@ -1166,7 +1213,7 @@ exportBtn.addEventListener('click', async () => {
     const speedPreset = speedSelect.value;
     // Flag encoding cepat: dipakai di setiap perintah yang meng-encode ulang video (libx264).
     // '-threads' memberi tahu x264 untuk memakai banyak core CPU sekaligus (butuh core-mt).
-    const speedFlags = ['-preset', speedPreset, ...threadArgs];
+    const speedFlags = ['-preset', speedPreset, ...threadArgs()];
     const caption = captionInput.value.trim();
     const mode = modeSelect.value;
     const outName = 'output.' + format;
